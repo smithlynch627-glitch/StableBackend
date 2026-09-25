@@ -4,7 +4,7 @@ import { one, q } from '../db.js';
 import { loadNetwork } from '../lib/network.js';
 import { getProvider } from '../lib/chain.js';
 import { expireOrders, refreshAllStats, takeSnapshots } from '../lib/stats.js';
-import { applyCollectionFlags, knownCollections, processLogs } from './core.js';
+import { applyCollectionFlags, knownCollections, processLogs, repairRawCidImages } from './core.js';
 
 const CHUNK = 2000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -71,6 +71,7 @@ async function main() {
   await loadNetwork();
   console.log(`[indexer] ${config.networkName} (chain ${config.chainId}), market ${config.market || '-'}, factory ${config.factory || '-'}`);
   await applyCollectionFlags().catch(() => {});
+  await repairRawCidImages().catch((e) => console.warn('[metadata]', e.message));
   let lastMaintenance = 0;
   let lastNetworkCheck = Date.now();
   let activeKey = `${config.networkKey}:${config.chainId}`;

@@ -5,6 +5,7 @@ import { config, ZERO_ADDRESS } from '../config.js';
 import { many, one, q } from '../db.js';
 import { COLLECTION_ABI, FACTORY_ABI, MARKET_ABI, collectionContract, getProvider, market as marketContract } from '../lib/chain.js';
 import { refreshCollectionStats } from '../lib/stats.js';
+import { assertPublicUrl } from '../lib/safeFetch.js';
 
 const colIface = new Interface(COLLECTION_ABI);
 const marketIface = new Interface(MARKET_ABI);
@@ -426,13 +427,72 @@ const GATEWAYS = [process.env.IPFS_GATEWAY, 'https://ipfs.io/ipfs/', 'https://dw
   .filter(Boolean)
   .map((g) => (g.endsWith('/') ? g : `${g}/`));
 
-const ipfsPath = (uri) => uri.slice(7).replace(/^ipfs\//, '');
+const ipfsPath = (uri) => fixIpfsPath(uri.slice(7).replace(/^ipfs\//, ''));
+/**
+ * A "bafkrei…" CID is a single raw file: it can never have a file name after it. Metadata made by uploading
+ * each image on its own and then writing "ipfs://bafkrei…/1.jpg" points nowhere, so the name is dropped.
+ */
+const RAW_CID_WITH_PATH = /^(bafkrei[a-z2-7]{20,})\/[^?#]*/i;
+const fixIpfsPath = (path) => path.replace(RAW_CID_WITH_PATH, '$1');
+export const hasRawCidPath = (uri) => typeof uri === 'string' && /(^ipfs:\/\/|\/ipfs\/)(ipfs\/)?bafkrei[a-z2-7]{20,}\/[^?#]+/i.test(uri);
 export const ipfsToHttp = (uri, gateway = GATEWAYS[0]) => {
   if (!uri || typeof uri !== 'string') return uri;
   if (uri.startsWith('ipfs://')) return `${gateway}${ipfsPath(uri)}`;
   if (uri.startsWith('ar://')) return `https://arweave.net/${uri.slice(5)}`;
-  return uri;
+  return uri.replace(/(\/ipfs\/)(bafkrei[a-z2-7]{20,})\/[^?#]*/i, '$1$2');
 };
+
+/** SQL that repairs image links already saved with a file name after a single-file CID. */
+export async function repairRawCidImages() {
+  const r = await q(
+    `update tokens set image_url = regexp_replace(image_url, '(/ipfs/bafkrei[a-z2-7]+)/[^?#]*', '\\1', 'i')
+     where image_url ~* '/ipfs/bafkrei[a-z2-7]+/[^?#]+'`,
+  );
+  if (r.rowCount) console.log(`[metadata] repaired ${r.rowCount} image links (file name after a single-file CID)`);
+}
+
+/** Checks that an image link really loads (first bytes only), trying every gateway for ipfs:// links. */
+export async function probeImage(uri, { timeout = 8_000 } = {}) {
+  const first = await probeOnce(uri, timeout);
+  if (first.ok) return first;
+  // "ipfs://<cid>/1.jpg" where <cid> is really a single file: the bare CID is what loads.
+  const bare = typeof uri === 'string' && uri.match(/^ipfs:\/\/(?:ipfs\/)?([a-z0-9]{40,})\/[^?#]+/i);
+  if (bare) {
+    const second = await probeOnce(`ipfs://${bare[1]}`, timeout);
+    if (second.ok) return { ...second, bareCid: true };
+  }
+  return first;
+}
+
+async function probeOnce(uri, timeout) {
+  if (!uri || typeof uri !== 'string') return { ok: false, error: 'no image' };
+  if (uri.startsWith('data:image/')) return { ok: true };
+  const trusted = uri.startsWith('ipfs://') || uri.startsWith('ar://');
+  const urls = uri.startsWith('ipfs://') ? GATEWAYS.map((g) => ipfsToHttp(uri, g)) : [ipfsToHttp(uri)];
+  let last = 'not reachable';
+  for (let url of urls) {
+    try {
+      // User-supplied web links are checked against private/internal addresses first (SSRF protection).
+      const get = async (u) => {
+        if (!trusted) await assertPublicUrl(u);
+        return fetch(u, { signal: AbortSignal.timeout(timeout), redirect: trusted ? 'follow' : 'manual', headers: { range: 'bytes=0-2047' } });
+      };
+      let res = await get(url);
+      if (!trusted && res.status >= 300 && res.status < 400 && res.headers.get('location')) {
+        url = new URL(res.headers.get('location'), url).toString();
+        res = await get(url);
+      }
+      const type = res.headers.get('content-type') || '';
+      await res.body?.cancel().catch(() => {});
+      if (!res.ok) { last = `HTTP ${res.status}`; continue; }
+      if (/^text\/html/i.test(type)) { last = 'the link opens a folder or web page, not an image'; continue; }
+      return { ok: true, url };
+    } catch (e) {
+      last = e.name === 'TimeoutError' ? 'timed out' : e.message;
+    }
+  }
+  return { ok: false, error: last };
+}
 
 /** Fetches JSON from ipfs:// (all gateways), ar:// or https://, with a timeout and a size cap. */
 export async function fetchJsonUri(uri, { timeout = 12_000, maxBytes = 1_000_000 } = {}) {

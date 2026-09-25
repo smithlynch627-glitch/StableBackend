@@ -7,7 +7,7 @@ import { config } from '../config.js';
 import { ah, bad, notFound } from '../lib/http.js';
 import { loadCollection } from '../lib/queries.js';
 import { safeGet } from '../lib/safeFetch.js';
-import { fetchJsonUri, ipfsToHttp } from '../indexer/core.js';
+import { fetchJsonUri, hasRawCidPath, ipfsToHttp, probeImage } from '../indexer/core.js';
 
 const r = Router();
 r.use(rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false }));
@@ -40,13 +40,21 @@ r.get('/metadata', ah(async (req, res) => {
   }
   if (!isAllowedUri(base)) throw bad('Base URI must start with ipfs://, ar:// or https://');
   if (!base.endsWith('/')) throw bad('Base URI must end with "/" (the contract adds "<id>.json")');
-  const ids = String(req.query.ids || '1,2,3').split(',').map((x) => x.trim()).filter((x) => /^\d{1,6}$/.test(x)).slice(0, 5);
+  const ids = [...new Set(String(req.query.ids || '1,2,3').split(',').map((x) => x.trim()).filter((x) => /^\d{1,6}$/.test(x)))].slice(0, 5);
   const items = await Promise.all(ids.map(async (id) => {
     const uri = `${base}${id}.json`;
     try {
       const m = await readMeta(uri);
       const attrs = Array.isArray(m.attributes) ? m.attributes : [];
-      return { id, uri, ok: true, name: m.name ?? null, image: ipfsToHttp(m.image || m.image_url || null), attributes: attrs.slice(0, 20), hasImage: Boolean(m.image || m.image_url) };
+      const raw = m.image || m.image_url || null;
+      // Is the image itself reachable? (Metadata can load while its image link is broken.)
+      const probe = raw ? await probeImage(raw) : { ok: false, error: 'no image field' };
+      return {
+        id, uri, ok: true, name: typeof m.name === 'string' ? m.name.trim() : null, image: ipfsToHttp(raw), attributes: attrs.slice(0, 20), hasImage: Boolean(raw),
+        rawImage: typeof raw === 'string' ? raw.slice(0, 300) : null,
+        imageIssue: hasRawCidPath(raw) || probe.bareCid ? 'raw_cid_path' : null,
+        imageOk: probe.ok, imageError: probe.ok ? null : probe.error,
+      };
     } catch (e) {
       return { id, uri, ok: false, error: e.message };
     }
