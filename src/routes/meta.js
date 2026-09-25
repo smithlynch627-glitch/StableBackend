@@ -4,12 +4,15 @@ import { ah } from '../lib/http.js';
 import { COLLECTION_COLS, publicConfig } from '../lib/queries.js';
 import { createNonce, requireAuth, verifySignIn } from '../lib/auth.js';
 import { roleOf } from '../lib/admin.js';
+import { networkStatus } from '../lib/network.js';
 
 const r = Router();
 
 r.get('/health', ah(async (_req, res) => {
   await one('select 1');
-  res.json({ ok: true, time: new Date().toISOString() });
+  const st = networkStatus();
+  // 503 until the active network (and its chain_<id> tables) is loaded, with the reason.
+  res.status(st.chain ? 200 : 503).json({ ok: Boolean(st.chain), ...st, time: new Date().toISOString() });
 }));
 
 r.get('/config', ah(async (_req, res) => res.json(await publicConfig())));

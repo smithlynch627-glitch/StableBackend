@@ -1,7 +1,7 @@
 // Active network = one row in app.networks. The admin panel switches it; every API instance and the
 // indexer pick the change up within a few seconds, and each chain keeps its data in its own schema.
 import { config } from '../config.js';
-import { many, one, q, useChain } from '../db.js';
+import { currentChainSchema, many, one, tx, useChain } from '../db.js';
 import { resetChainClients } from './chain.js';
 
 // Snapshot of the network settings from .env, taken before any database values are applied.
@@ -24,6 +24,32 @@ const ENV = {
 
 let loadedKey = null;
 let loadedAt = null;
+// Chains whose tables were created/updated by this process. The update runs once per process (not on every
+// 10-second check), with a lock timeout so it can never hold up live traffic.
+const ensured = new Set();
+const status = { error: null, schemaWarning: null };
+export const networkStatus = () => ({ chain: currentChainSchema(), network: config.networkKey || null, ...status });
+
+let lastEnsureFailure = 0;
+
+async function ensureSchema(chainId) {
+  if (ensured.has(chainId)) return;
+  if (Date.now() - lastEnsureFailure < 5 * 60_000) return; // after a failure, retry every 5 minutes
+  try {
+    await tx(async (h) => {
+      await h.q(`set local lock_timeout = '3s'`);
+      await h.q(`set local statement_timeout = '120s'`);
+      await h.q('select app.ensure_chain_schema($1)', [chainId]);
+    });
+    ensured.add(chainId);
+    status.schemaWarning = null;
+  } catch (e) {
+    // The tables normally exist already; keep serving with them and retry later.
+    lastEnsureFailure = Date.now();
+    status.schemaWarning = e.message;
+    console.error(`[db] Could not update the chain_${chainId} tables (${e.message}). Using the existing tables. If this keeps appearing, run the latest stable-supabase-update.sql in Supabase → SQL Editor.`);
+  }
+}
 const listeners = new Set();
 export const onNetworkChange = (fn) => listeners.add(fn);
 
@@ -49,6 +75,17 @@ function apply(n) {
 
 /** Loads the active network (creating the first one from env if the table is empty). */
 export async function loadNetwork() {
+  try {
+    const n = await loadNetworkInner();
+    status.error = null;
+    return n;
+  } catch (e) {
+    status.error = e.message;
+    throw e;
+  }
+}
+
+async function loadNetworkInner() {
   let n = await one(`select * from app.networks where is_active`);
   if (!n) {
     n = await one(
@@ -71,7 +108,7 @@ export async function loadNetwork() {
       console.log(`[network] applied from .env: ${changed.map(([k]) => k).join(', ')}`);
     }
   }
-  await q(`select app.ensure_chain_schema($1)`, [n.chain_id]);
+  await ensureSchema(n.chain_id);
   await useChain(n.chain_id);
   apply(n);
   const changed = loadedKey !== null && (loadedKey !== n.key || String(loadedAt) !== String(n.updated_at));
@@ -86,7 +123,7 @@ export function watchNetwork(ms = 10_000) {
   setInterval(async () => {
     try {
       const n = await one(`select key, updated_at from app.networks where is_active`);
-      if (n && (n.key !== loadedKey || String(n.updated_at) !== String(loadedAt))) {
+      if (n && (n.key !== loadedKey || String(n.updated_at) !== String(loadedAt) || !ensured.has(config.chainId) || !currentChainSchema())) {
         await loadNetwork();
         console.log(`[network] now on ${config.networkName} (chain ${config.chainId})`);
       }
