@@ -13,7 +13,7 @@ import { discover, importCollection } from '../lib/explorer.js';
 import { SETTING_KEYS, getSettings, setSettings } from '../lib/settings.js';
 import { loadNetwork, listNetworks } from '../lib/network.js';
 import { chainFees, collectionContract, factory as factoryContract, getProvider, market as marketContract } from '../lib/chain.js';
-import { applyCollectionFlags, queueMetadata, syncCollectionFromChain } from '../indexer/core.js';
+import { applyCollectionFlags, queueMetadata, repairCollection, syncCollectionFromChain } from '../indexer/core.js';
 
 const r = Router();
 // Defense in depth: the admin API only answers the separate admin site, never the public marketplace origin.
@@ -138,12 +138,17 @@ r.post('/collections/:address/refresh', requireRole('admin'), ah(async (req, res
   const address = addrParam(req.params.address);
   const col = await one(`select is_external from collections where address = $1`, [address]);
   if (!col) throw notFound('Collection not found');
+  let repair = null;
   if (col.is_external) await importCollection(address);
-  else await syncCollectionFromChain(address);
+  else {
+    await syncCollectionFromChain(address);
+    // Re-read the collection's on-chain history too, so any missed mints, transfers or sales come back.
+    repair = await repairCollection(address, { force: true });
+  }
   const ids = await many(`select token_id::text as id from tokens where collection = $1 limit 20000`, [address]);
   ids.forEach((t) => queueMetadata(address, t.id));
   await audit(req, 'collection.refresh', address);
-  res.json({ ok: true, tokens: ids.length });
+  res.json({ ok: true, tokens: ids.length, repair });
 }));
 
 // ── Site settings (footer community links) ──────────────────────────────────

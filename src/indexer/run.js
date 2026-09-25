@@ -4,7 +4,7 @@ import { many, one, q } from '../db.js';
 import { loadNetwork } from '../lib/network.js';
 import { collectionContract, getProvider } from '../lib/chain.js';
 import { expireOrders, refreshAllStats, takeSnapshots } from '../lib/stats.js';
-import { applyCollectionFlags, backfillMetadata, blockTime, knownCollections, processLogs, repairRawCidImages } from './core.js';
+import { applyCollectionFlags, backfillMetadata, knownCollections, processLogs, repairCollection, repairRawCidImages } from './core.js';
 
 const CHUNK = 2000;
 // The public RPC is load-balanced: the node that answers getLogs can be a few blocks behind the node that
@@ -86,47 +86,28 @@ async function tick() {
   return latest;
 }
 
-/** First block at or after a time (binary search on block headers). */
-async function blockAt(ms, latest) {
-  let lo = 0; // collections from before a contract upgrade can be older than INDEXER_START_BLOCK
-  let hi = latest;
-  if ((await blockTime(lo)).getTime() >= ms) return lo;
-  while (lo < hi) {
-    const mid = Math.floor((lo + hi) / 2);
-    if ((await blockTime(mid)).getTime() < ms) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo;
-}
-
 /**
  * Safety net: for launchpad collections, the number of tokens on-chain must match the database.
  * If the contract has more (events were missed), that collection's history is read again.
- * One collection is repaired per round so the live indexing never waits long.
+ * One collection is repaired per round so live indexing never waits long.
  */
+const lastSeenOnchain = new Map(); // address → totalSupply seen at the previous round
 async function reconcile() {
-  const cols = await many(`select address, created_at from collections where not is_external order by created_at desc limit 300`);
+  const cols = await many(`select address, max_supply, total_supply from collections where not is_external order by created_at desc limit 300`);
   const counts = new Map((await many(`select collection, count(*)::int as n from tokens group by collection`)).map((r) => [r.collection, r.n]));
-  for (let i = 0; i < cols.length; i += 6) {
-    const part = cols.slice(i, i + 6);
+  const open = cols.filter((c) => !(c.max_supply && (counts.get(c.address) || 0) >= c.max_supply));
+  let target = null;
+  for (let i = 0; i < open.length; i += 6) {
+    const part = open.slice(i, i + 6);
     const onchain = await Promise.all(part.map((c) => collectionContract(c.address).totalSupply().then(Number).catch(() => -1)));
-    const idx = part.findIndex((c, k) => onchain[k] > (counts.get(c.address) || 0));
-    if (idx === -1) continue;
-    const c = part[idx];
-    const provider = getProvider();
-    const cursor = await getCursor();
-    const start = await blockAt(new Date(c.created_at).getTime() - 10 * 60_000, cursor);
-    console.log(`[indexer] ${c.address}: ${onchain[idx]} on-chain, ${counts.get(c.address) || 0} indexed. Re-reading from block ${start}.`);
-    for (let from = start; from <= cursor; from += CHUNK) {
-      const to = Math.min(cursor, from + CHUNK - 1);
-      // The marketplace is read too, so sales in that history are recognised as sales.
-      const logs = await provider.getLogs({ address: [c.address, config.market].filter(Boolean), fromBlock: from, toBlock: to });
-      if (logs.length) await processLogs(logs);
-    }
-    const after = (await one(`select count(*)::int as n from tokens where collection = $1`, [c.address])).n;
-    console.log(`[indexer] ${c.address}: ${after} tokens indexed after repair.`);
-    return;
+    part.forEach((c, k) => {
+      const indexed = counts.get(c.address) || 0;
+      // Missed only if the database is still below what the contract had a full round ago.
+      if (!target && (lastSeenOnchain.get(c.address) ?? -1) > indexed) target = c.address;
+      if (onchain[k] >= 0) lastSeenOnchain.set(c.address, onchain[k]);
+    });
   }
+  if (target) await repairCollection(target);
 }
 
 async function main() {

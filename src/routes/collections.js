@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { many, one } from '../db.js';
 import { ah, clampInt } from '../lib/http.js';
 import { BEST_LISTING_JOIN, COLLECTION_COLS, TOKEN_COLS, loadCollection, loadDrop, traitCounts } from '../lib/queries.js';
+import { maybeRepair } from '../indexer/core.js';
 
 const r = Router();
 
@@ -26,6 +27,7 @@ r.get('/', ah(async (req, res) => {
 
 r.get('/:key', ah(async (req, res) => {
   const col = await loadCollection(req.params.key);
+  maybeRepair(col);
   res.json({ collection: col, drop: await loadDrop(col) });
 }));
 

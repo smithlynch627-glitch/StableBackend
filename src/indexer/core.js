@@ -62,6 +62,83 @@ export async function blockTime(n) {
   return blockTimes.get(n);
 }
 
+/** Block header time (ms). Retries, and throws if the RPC can't answer: repairs must never guess a range. */
+async function headerTime(n) {
+  for (let i = 0; i < 6; i++) {
+    const b = await getProvider().getBlock(n).catch(() => null);
+    if (b) return Number(b.timestamp) * 1000;
+    await new Promise((r) => setTimeout(r, 300 * (i + 1)));
+  }
+  throw new Error(`block ${n} not available from the RPC`);
+}
+
+/** First block at or after a time (binary search on block headers, ~26 lookups). */
+export async function blockAtTime(ms, latest) {
+  let lo = 0;
+  let hi = latest;
+  if ((await headerTime(lo)) >= ms) return lo;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if ((await headerTime(mid)) < ms) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+const repairs = new Map(); // address → running repair
+const lastRepairCheck = new Map(); // address → { t, onchain } from the last check
+
+/**
+ * Self-repair for launchpad collections: if the contract has minted more tokens than the database knows,
+ * the collection's history (and the marketplace, so sales stay sales) is read again from its creation block.
+ * Everything it writes is idempotent, so running it twice is harmless.
+ */
+export function repairCollection(address, { force = false } = {}) {
+  if (repairs.has(address)) return repairs.get(address);
+  const run = (async () => {
+    const col = await one(`select address, created_at, is_external from collections where address = $1`, [address]);
+    if (!col || col.is_external) return { repaired: false };
+    const onchain = Number(await collectionContract(address).totalSupply());
+    const before = (await one(`select count(*)::int as n from tokens where collection = $1`, [address])).n;
+    if (!force && onchain <= before) return { repaired: false, onchain, indexed: before };
+    const provider = getProvider();
+    const latest = (await provider.getBlockNumber()) - 2;
+    const start = await blockAtTime(new Date(col.created_at).getTime() - 10 * 60_000, latest);
+    console.log(`[repair] ${address}: ${onchain} on-chain, ${before} indexed. Re-reading blocks ${start}-${latest}.`);
+    for (let from = start; from <= latest; from += 2000) {
+      const to = Math.min(latest, from + 1999);
+      const logs = await provider.getLogs({ address: [address, config.market].filter(Boolean), fromBlock: from, toBlock: to });
+      if (logs.length) await processLogs(logs);
+    }
+    await refreshCollectionStats(address);
+    const after = (await one(`select count(*)::int as n from tokens where collection = $1`, [address])).n;
+    console.log(`[repair] ${address}: ${after} tokens indexed.`);
+    return { repaired: true, onchain, indexed: after };
+  })().finally(() => repairs.delete(address));
+  repairs.set(address, run);
+  return run;
+}
+
+/**
+ * Called when a collection or mint page is viewed. A collection is repaired only when the gap persists:
+ * the indexed count must still be below what the contract showed at the previous check (≥ 2 min earlier),
+ * so a mint that the indexer is about to pick up never triggers a needless re-read.
+ */
+export function maybeRepair(col) {
+  if (!col?.address || col.is_external) return;
+  if (col.max_supply && col.total_supply >= col.max_supply) return; // everything is already indexed
+  const now = Date.now();
+  const prev = lastRepairCheck.get(col.address);
+  if (prev && now - prev.t < 120_000) return;
+  lastRepairCheck.set(col.address, { t: now, onchain: prev?.onchain ?? null });
+  (async () => {
+    const onchain = Number(await collectionContract(col.address).totalSupply());
+    const indexed = (await one(`select count(*)::int as n from tokens where collection = $1`, [col.address])).n;
+    lastRepairCheck.set(col.address, { t: now, onchain });
+    if (prev?.onchain != null && indexed < prev.onchain) await repairCollection(col.address);
+  })().catch((e) => console.warn('[repair]', col.address, e.shortMessage || e.message));
+}
+
 export async function knownCollections() {
   return new Set((await many(`select address from collections`)).map((r) => r.address));
 }

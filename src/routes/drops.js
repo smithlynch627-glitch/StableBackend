@@ -7,7 +7,7 @@ import { requireAuth } from '../lib/auth.js';
 import { COLLECTION_COLS, loadCollection, loadDrop } from '../lib/queries.js';
 import { dropState } from '../lib/drops.js';
 import { collectionContract, isLaunchpadCollection } from '../lib/chain.js';
-import { phaseTxContext, syncCollectionFromChain } from '../indexer/core.js';
+import { maybeRepair, phaseTxContext, syncCollectionFromChain } from '../indexer/core.js';
 
 const r = Router();
 const publicPhases = (phases) => phases.map(({ allowlistId, merkleRoot, ...p }) => ({ ...p, hasAllowlist: Boolean(merkleRoot && !/^0x0+$/.test(merkleRoot)) }));
@@ -31,6 +31,7 @@ r.get('/', ah(async (req, res) => {
 
 r.get('/:key', ah(async (req, res) => {
   const col = await loadCollection(req.params.key);
+  maybeRepair(col);
   const drop = await loadDrop(col);
   if (!drop) throw bad('This collection has no launchpad drop', 'no_drop');
   res.json({ collection: col, drop });
