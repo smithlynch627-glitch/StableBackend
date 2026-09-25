@@ -1,12 +1,12 @@
 // Signed StableMarket orders + transaction sync.
 import { Router } from 'express';
 import { config } from '../config.js';
-import { one, q } from '../db.js';
+import { many, one, q } from '../db.js';
 import { ah, bad, notFound } from '../lib/http.js';
 import { loadCollection } from '../lib/queries.js';
 import { validateOrder } from '../lib/market.js';
 import { refreshCollectionStats } from '../lib/stats.js';
-import { getProvider } from '../lib/chain.js';
+import { getProvider, market } from '../lib/chain.js';
 import { processLogs } from '../indexer/core.js';
 
 const r = Router();
@@ -19,13 +19,23 @@ r.post('/', ah(async (req, res) => {
   const tokenId = o.anyToken ? null : o.tokenId;
 
   if (kind === 'listing') {
-    const current = await one(
-      `select price_wei from orders where collection = $1 and token_id = $2 and maker = $3 and kind = 'listing' and status = 'active'
-       order by price_wei asc limit 1`,
-      [col.address, tokenId, o.maker],
+    // A cheaper listing that is still open would let buyers skip the new, higher price. The site cancels it on-chain
+    // first; if our database has not seen that cancel yet, the contract is asked directly.
+    const cheaper = await many(
+      `select hash, counter from orders where collection = $1 and token_id = $2 and maker = $3 and kind = 'listing' and status = 'active'
+         and end_time > now() and price_wei < $4`,
+      [col.address, tokenId, o.maker, o.price],
     );
-    if (current && BigInt(current.price_wei) < BigInt(o.price)) {
-      throw bad('Cancel your current listing before raising the price. A cheaper signed listing stays valid until it is cancelled.', 'raise_price');
+    for (const c of cheaper) {
+      // The RPC node we reach can be a block behind the wallet's, so a just-sent cancel gets a few seconds.
+      let state = null;
+      for (let i = 0; i < 8 && !state; i++) {
+        const [isCancelled, isFilled, counter] = await Promise.all([market().cancelled(c.hash), market().filled(c.hash), market().counters(o.maker)]);
+        if (isCancelled || isFilled || BigInt(c.counter) < BigInt(counter)) state = isFilled ? 'filled' : 'cancelled';
+        else if (i < 7) await new Promise((r) => setTimeout(r, 500));
+      }
+      if (!state) throw bad('Cancel your current listing before raising the price. A cheaper signed listing stays valid until it is cancelled.', 'raise_price');
+      await q(`update orders set status = $2, updated_at = now() where hash = $1 and status = 'active'`, [c.hash, state]);
     }
   }
 
@@ -43,6 +53,21 @@ r.post('/', ah(async (req, res) => {
     await refreshCollectionStats(col.address);
   }
   res.json({ hash, kind });
+}));
+
+/** A wallet's open listings for one item (used to cancel them all before listing at a higher price). */
+r.get('/', ah(async (req, res) => {
+  const collection = String(req.query.collection || '').toLowerCase();
+  const maker = String(req.query.maker || '').toLowerCase();
+  const tokenId = String(req.query.token || '');
+  if (!/^0x[0-9a-f]{40}$/.test(collection) || !/^0x[0-9a-f]{40}$/.test(maker) || !/^\d{1,78}$/.test(tokenId)) throw bad('collection, token and maker are required');
+  const rows = await many(
+    `select hash, kind, token_id::text as token_id, maker, price_wei, currency, status, end_time, order_json
+     from orders where collection = $1 and token_id = $2 and maker = $3 and kind = 'listing' and status = 'active' and end_time > now()
+     order by price_wei asc limit 20`,
+    [collection, tokenId, maker],
+  );
+  res.json({ orders: rows });
 }));
 
 r.get('/:hash', ah(async (req, res) => {

@@ -13,7 +13,7 @@ r.get('/:collection/:tokenId', ah(async (req, res) => {
     [col.address, tokenId],
   );
   if (!token || !token.owner) throw notFound('Item not found');
-  const [offers, traits] = await Promise.all([
+  const [offers, traits, ranked] = await Promise.all([
     many(
       `select hash, kind, token_id::text as token_id, maker, price_wei, currency, end_time, created_at
        from orders where collection = $1 and status = 'active'
@@ -22,10 +22,12 @@ r.get('/:collection/:tokenId', ah(async (req, res) => {
       [col.address, tokenId],
     ),
     traitCounts(col.address),
+    one(`select count(*)::int as n from tokens where collection = $1 and rarity_rank is not null`, [col.address]),
   ]);
   const countOf = (type, value) => traits.find((t) => t.trait_type === type)?.values.find((v) => v.value === value)?.count ?? 0;
   const attributes = (token.attributes || []).map((a) => ({ ...a, count: countOf(a.trait_type, String(a.value)) }));
-  res.json({ token: { ...token, attributes }, collection: col, offers });
+  // rarity_of: how many items have a rank (all revealed items), so "rank 22 of N" and its colour use the same N.
+  res.json({ token: { ...token, attributes, rarity_of: ranked.n || null }, collection: col, offers });
 }));
 
 export default r;

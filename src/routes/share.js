@@ -8,6 +8,8 @@ import { ah, bad, notFound } from '../lib/http.js';
 import { loadCollection } from '../lib/queries.js';
 import { safeGet } from '../lib/safeFetch.js';
 import { fetchJsonUri, hasRawCidPath, ipfsToHttp, metadataMedia, probeImage } from '../indexer/core.js';
+import { parseIpfs } from '../lib/ipfs.js';
+import { inspectBase, validateBase } from '../lib/metaCheck.js';
 
 const r = Router();
 r.use(rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false }));
@@ -60,6 +62,31 @@ r.get('/metadata', ah(async (req, res) => {
     }
   }));
   res.json({ items });
+}));
+
+/**
+ * GET /api/share/ipfs/inspect?base=ipfs://CID/&supply=222 → what is in the folder + tokens 1, 2 and the last one.
+ * GET /api/share/ipfs/validate?base=…&supply=…             → every token file and the images folder.
+ * Both answer { stage: "pending" } while IPFS is still spreading a fresh upload; the page asks again shortly.
+ */
+const baseOf = (req) => {
+  const base = String(req.query.base || '').trim();
+  if (!parseIpfs(base)) throw bad('Use an ipfs://… folder link');
+  if (!base.endsWith('/')) throw bad('The folder link must end with "/" (the contract adds "<id>.json")');
+  const supply = Math.max(0, Math.min(200_000, Number.parseInt(String(req.query.supply || '0'), 10) || 0));
+  return { base, supply };
+};
+r.get('/ipfs/inspect', ah(async (req, res) => {
+  const { base, supply } = baseOf(req);
+  res.json(await inspectBase(base, supply));
+}));
+r.get('/ipfs/validate', ah(async (req, res) => {
+  const { base, supply } = baseOf(req);
+  try {
+    res.json({ stage: 'found', ...(await validateBase(base, supply)) });
+  } catch (e) {
+    res.json(e.notFound ? { stage: 'bad', error: e.message } : { stage: 'pending', error: e.message });
+  }
 }));
 
 // ── Share cards ─────────────────────────────────────────────────────────────

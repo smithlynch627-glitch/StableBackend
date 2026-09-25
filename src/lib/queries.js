@@ -46,19 +46,35 @@ export async function loadDrop(col) {
   return { ...dropState(phases, col.total_supply, col.max_supply), platformFeeBps: d.platform_fee_bps, featured: d.featured, changes };
 }
 
+/** Value used for "this item has no <trait type>" (e.g. no Hat), in trait counts and filters. */
+export const NO_TRAIT = '__none__';
+
 export async function traitCounts(collection) {
-  const rows = await many(
-    `select a->>'trait_type' as trait_type, a->>'value' as value, count(*)::int as count
-     from tokens t, jsonb_array_elements(t.attributes) a
-     where t.collection = $1 and t.owner is not null
-     group by 1, 2 order by 1, 3 desc`,
-    [collection],
-  );
+  const [rows, missing] = await Promise.all([
+    many(
+      `select a->>'trait_type' as trait_type, a->>'value' as value, count(*)::int as count
+       from tokens t, jsonb_array_elements(t.attributes) a
+       where t.collection = $1 and t.owner is not null and jsonb_typeof(t.attributes) = 'array'
+       group by 1, 2 order by 1, 3 desc`,
+      [collection],
+    ),
+    // Items (with traits) that lack a trait type other items have.
+    many(
+      `with toks as (select attributes from tokens where collection = $1 and owner is not null
+                       and jsonb_typeof(attributes) = 'array' and jsonb_array_length(attributes) > 0),
+            types as (select distinct a->>'trait_type' as tt from toks, jsonb_array_elements(toks.attributes) a)
+       select ty.tt as trait_type, count(*)::int as count from toks cross join types ty
+       where not exists (select 1 from jsonb_array_elements(toks.attributes) a where a->>'trait_type' = ty.tt)
+       group by 1`,
+      [collection],
+    ),
+  ]);
   const map = new Map();
   for (const r of rows) {
     if (!map.has(r.trait_type)) map.set(r.trait_type, []);
     map.get(r.trait_type).push({ value: r.value, count: r.count });
   }
+  for (const m of missing) if (m.count > 0 && map.has(m.trait_type)) map.get(m.trait_type).push({ value: NO_TRAIT, count: m.count });
   return [...map].map(([trait_type, values]) => ({ trait_type, values }));
 }
 

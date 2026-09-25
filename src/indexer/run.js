@@ -4,7 +4,7 @@ import { many, one, q } from '../db.js';
 import { loadNetwork } from '../lib/network.js';
 import { collectionContract, getProvider } from '../lib/chain.js';
 import { expireOrders, refreshAllStats, takeSnapshots } from '../lib/stats.js';
-import { applyCollectionFlags, backfillMetadata, knownCollections, processLogs, repairCollection, repairRawCidImages } from './core.js';
+import { applyCollectionFlags, backfillMetadata, computeRarity, knownCollections, processLogs, repairCollection, repairRawCidImages } from './core.js';
 
 const CHUNK = 2000;
 // The public RPC is load-balanced: the node that answers getLogs can be a few blocks behind the node that
@@ -115,6 +115,10 @@ async function main() {
   console.log(`[indexer] ${config.networkName} (chain ${config.chainId}), market ${config.market || '-'}, factory ${config.factory || '-'}`);
   await applyCollectionFlags().catch(() => {});
   await repairRawCidImages().catch((e) => console.warn('[metadata]', e.message));
+  // Re-rank every collection once at start, so rarity rule changes apply to existing collections too.
+  for (const { address } of await many(`select address from collections`).catch(() => [])) {
+    await computeRarity(address).catch((e) => console.warn('[rarity]', address, e.message));
+  }
   let lastMaintenance = 0;
   let lastReconcile = Date.now() - 100_000; // first check ~20 s after start
   let lastNetworkCheck = Date.now();

@@ -1,6 +1,7 @@
 // Turns GIWA logs into marketplace state. Used by the indexer loop and by POST /api/orders/sync,
 // so a user's own transaction shows up immediately.
 import { Interface } from 'ethers';
+import { parseIpfs, probeIpfs, readIpfsJson } from '../lib/ipfs.js';
 import { config, ZERO_ADDRESS } from '../config.js';
 import { many, one, q } from '../db.js';
 import { COLLECTION_ABI, FACTORY_ABI, MARKET_ABI, collectionContract, getProvider, market as marketContract } from '../lib/chain.js';
@@ -494,7 +495,7 @@ export function queueMetadata(collection, tokenId, attempt = 0) {
 async function drain() {
   running = true;
   while (queue.length) {
-    const batch = queue.splice(0, 4); // public IPFS gateways rate-limit bursts
+    const batch = queue.splice(0, 8); // folder reads are cached, so most of these never touch a gateway
     await Promise.all(
       batch.map(async ([c, id, attempt]) => {
         const key = `${c}:${id}`;
@@ -532,16 +533,10 @@ export async function backfillMetadata(limit = 40) {
   return rows.length;
 }
 
-/** Gateways tried in order. IPFS_GATEWAY (e.g. your dedicated Pinata gateway) goes first. */
+/** Gateway used in saved image links (IPFS_GATEWAY if set). Fetching uses lib/ipfs.js, which races several. */
 const GATEWAYS = [process.env.IPFS_GATEWAY, 'https://ipfs.io/ipfs/', 'https://w3s.link/ipfs/', 'https://dweb.link/ipfs/', 'https://4everland.io/ipfs/', 'https://gateway.pinata.cloud/ipfs/']
   .filter(Boolean)
   .map((g) => (g.endsWith('/') ? g : `${g}/`));
-const coolDown = new Map(); // gateway → time it may be used again (after HTTP 429)
-const gatewayOrder = () => {
-  const now = Date.now();
-  const ok = GATEWAYS.filter((g) => !(coolDown.get(g) > now));
-  return ok.length ? ok : GATEWAYS;
-};
 
 const ipfsPath = (uri) => fixIpfsPath(uri.slice(7).replace(/^ipfs\//, ''));
 /**
@@ -583,6 +578,7 @@ export async function probeImage(uri, { timeout = 8_000 } = {}) {
 async function probeOnce(uri, timeout) {
   if (!uri || typeof uri !== 'string') return { ok: false, error: 'no image' };
   if (uri.startsWith('data:image/')) return { ok: true };
+  if (uri.startsWith('ipfs://')) return probeIpfs(uri, { timeout: Math.max(timeout, 10_000) });
   const trusted = uri.startsWith('ipfs://') || uri.startsWith('ar://');
   const urls = uri.startsWith('ipfs://') ? GATEWAYS.map((g) => ipfsToHttp(uri, g)) : [ipfsToHttp(uri)];
   let last = 'not reachable';
@@ -614,7 +610,9 @@ async function probeOnce(uri, timeout) {
 export async function fetchJsonUri(uri, { timeout = 12_000, maxBytes = 1_000_000 } = {}) {
   if (uri.startsWith('data:application/json;base64,')) return JSON.parse(Buffer.from(uri.split(',')[1], 'base64').toString('utf8'));
   if (uri.startsWith('data:application/json')) return JSON.parse(decodeURIComponent(uri.split(',').slice(1).join(',')));
-  const gws = uri.startsWith('ipfs://') ? gatewayOrder() : [null];
+  // ipfs:// and gateway links (…/ipfs/<cid>/…): hedged across gateways, whole folders cached in memory.
+  if (parseIpfs(uri)) return readIpfsJson(uri, { timeout: Math.max(timeout, 20_000) });
+  const gws = [null];
   let last;
   for (const g of gws) {
     const url = g ? ipfsToHttp(uri, g) : ipfsToHttp(uri);
@@ -625,7 +623,6 @@ export async function fetchJsonUri(uri, { timeout = 12_000, maxBytes = 1_000_000
         return JSON.parse(buf.toString('utf8'));
       }
       const res = await fetch(url, { signal: AbortSignal.timeout(timeout), headers: { accept: 'application/json' } });
-      if (res.status === 429 && g) coolDown.set(g, Date.now() + 60_000);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const buf = Buffer.from(await res.arrayBuffer());
       if (buf.length > maxBytes) throw new Error('metadata file too large');
@@ -672,19 +669,43 @@ export async function fetchMetadata(collection, tokenId) {
 }
 
 /**
- * Rarity rank per collection: each trait adds ln(total / tokens-with-that-trait), rarest total score = rank 1.
- * Tokens without attributes (e.g. before reveal) get no rank.
+ * Rarity rank per collection (statistical rarity, the method most marketplaces use):
+ * each trait adds ln(items / items-with-that-trait), and the highest total is rank 1.
+ * - A token without a trait type that others have counts as "None" for it, so missing traits are rare too.
+ * - Numeric traits (display_type number / boost / date) are levels, not rarity, and are skipped.
+ * - Values are compared as text, so 5 and "5" are the same trait. Burned tokens are left out.
+ * - Tokens without attributes (e.g. before reveal) get no rank, and neither does a collection where every
+ *   token has the exact same traits (a shared placeholder), since a rank would mean nothing there.
  */
 export async function computeRarity(collection) {
+  // One statement, so ranks never flicker: every token of the collection gets its new rank or null.
   await q(
-    `with toks as (select token_id, attributes from tokens where collection = $1 and jsonb_typeof(attributes) = 'array' and jsonb_array_length(attributes) > 0),
-          total as (select count(*)::float as n from toks),
-          traits as (select t.token_id, a->>'trait_type' as tt, a->>'value' as v from toks t, jsonb_array_elements(t.attributes) a),
-          freq as (select tt, v, count(*)::float as c from traits group by tt, v),
-          scores as (select tr.token_id, sum(ln((select n from total) / f.c)) as s from traits tr join freq f using (tt, v) group by tr.token_id),
-          ranked as (select token_id, rank() over (order by s desc) as r from scores)
-     update tokens t set rarity_rank = ranked.r from ranked where t.collection = $1 and t.token_id = ranked.token_id`,
+    `with toks as (
+       select token_id, attributes from tokens
+       where collection = $1 and owner is not null and jsonb_typeof(attributes) = 'array' and jsonb_array_length(attributes) > 0),
+     total as (select count(*)::float as n from toks),
+     traits as (
+       select distinct t.token_id, btrim(a->>'trait_type') as tt, coalesce(btrim(a->>'value'), '') as v
+       from toks t, jsonb_array_elements(t.attributes) a
+       where jsonb_typeof(a) = 'object' and a ? 'trait_type'
+         and coalesce(a->>'display_type', '') not in ('number', 'boost_number', 'boost_percentage', 'date')),
+     types as (select distinct tt from traits),
+     filled as (
+       select token_id, tt, v from traits
+       union all
+       select t.token_id, ty.tt, '__missing__' from toks t cross join types ty
+       where not exists (select 1 from traits x where x.token_id = t.token_id and x.tt = ty.tt)),
+     freq as (select tt, v, count(*)::float as c from filled group by tt, v),
+     scores as (
+       select f.token_id, round(sum(ln((select n from total) / fr.c))::numeric, 9) as s
+       from filled f join freq fr using (tt, v) group by f.token_id),
+     ranked as (
+       select token_id, rank() over (order by s desc) as r from scores
+       where (select count(distinct s) from scores) > 1 or (select n from total) = 1),
+     next as (
+       select tk.token_id, rk.r from tokens tk left join ranked rk using (token_id) where tk.collection = $1)
+     update tokens t set rarity_rank = next.r from next
+     where t.collection = $1 and t.token_id = next.token_id and t.rarity_rank is distinct from next.r`,
     [collection],
   );
-  await q(`update tokens set rarity_rank = null where collection = $1 and (jsonb_typeof(attributes) <> 'array' or jsonb_array_length(attributes) = 0)`, [collection]);
 }

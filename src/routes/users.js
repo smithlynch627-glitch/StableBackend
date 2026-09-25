@@ -49,7 +49,7 @@ r.get('/:address/tokens', ah(async (req, res) => {
   const limit = clampInt(req.query.limit, 1, 100, 60);
   const offset = clampInt(req.query.offset, 0, 1_000_000, 0);
   const rows = await many(
-    `select ${TOKEN_COLS}, c.name as collection_name, c.slug as collection_slug, c.art_style, c.tradable, c.is_official, count(*) over() as total_count
+    `select ${TOKEN_COLS}, c.name as collection_name, c.slug as collection_slug, c.art_style, c.tradable, c.is_official, c.total_supply as collection_supply, count(*) over() as total_count
      from tokens t ${BEST_LISTING_JOIN} join collections c on c.address = t.collection
      where t.owner = $1 and not c.hidden order by t.minted_at desc, t.token_id asc limit ${limit} offset ${offset}`,
     [address],

@@ -22,6 +22,8 @@ const ORDER_TUPLE =
 export const MARKET_ABI = [
   'function marketFeeBps() view returns (uint16)',
   'function counters(address) view returns (uint256)',
+  'function cancelled(bytes32) view returns (bool)',
+  'function filled(bytes32) view returns (bool)',
   `function hashOrder(${ORDER_TUPLE} o) view returns (bytes32)`,
   `function checkOrder(${ORDER_TUPLE} o, bytes signature, uint256 tokenId, address taker) view returns (uint8)`,
   'function isTradable(address) view returns (bool)',
