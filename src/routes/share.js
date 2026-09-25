@@ -7,7 +7,7 @@ import { config } from '../config.js';
 import { ah, bad, notFound } from '../lib/http.js';
 import { loadCollection } from '../lib/queries.js';
 import { safeGet } from '../lib/safeFetch.js';
-import { fetchJsonUri, hasRawCidPath, ipfsToHttp, probeImage } from '../indexer/core.js';
+import { fetchJsonUri, hasRawCidPath, ipfsToHttp, metadataMedia, probeImage } from '../indexer/core.js';
 
 const r = Router();
 r.use(rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false }));
@@ -33,7 +33,7 @@ r.get('/metadata', ah(async (req, res) => {
     if (!isAllowedUri(single) && !single.startsWith('data:application/json')) throw bad('Use an ipfs://, ar:// or https:// link');
     try {
       const m = await readMeta(single);
-      return res.json({ items: [{ ok: true, name: m.name ?? null, image: ipfsToHttp(m.image || m.image_url || null), attributes: Array.isArray(m.attributes) ? m.attributes.length : 0 }] });
+      return res.json({ items: [{ ok: true, name: m.name ?? null, image: metadataMedia(m), attributes: Array.isArray(m.attributes) ? m.attributes.length : 0 }] });
     } catch (e) {
       return res.json({ items: [{ ok: false, error: e.message }] });
     }
@@ -46,7 +46,7 @@ r.get('/metadata', ah(async (req, res) => {
     try {
       const m = await readMeta(uri);
       const attrs = Array.isArray(m.attributes) ? m.attributes : [];
-      const raw = m.image || m.image_url || null;
+      const raw = m.image || m.image_url || (typeof m.image_data === 'string' && m.image_data.includes('<svg') ? `data:image/svg+xml;base64,${Buffer.from(m.image_data).toString('base64')}` : null) || m.animation_url || null;
       // Is the image itself reachable? (Metadata can load while its image link is broken.)
       const probe = raw ? await probeImage(raw) : { ok: false, error: 'no image field' };
       return {

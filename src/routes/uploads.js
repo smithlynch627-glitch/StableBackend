@@ -13,7 +13,7 @@ const r = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024, files: 1 } });
 const perWallet = (limit, windowMs) =>
   rateLimit({ windowMs, limit, keyGenerator: (req) => req.user || req.ip, standardHeaders: 'draft-7', legacyHeaders: false });
-const IMAGE = /^image\/(png|jpe?g|gif|webp)$/;
+const IMAGE = /^image\/(png|jpe?g|gif|webp|avif|svg\+xml|bmp)$/;
 
 // Magic-byte check so a renamed file cannot pretend to be an image.
 function sniff(buf) {
@@ -21,6 +21,12 @@ function sniff(buf) {
   if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
   if (buf.subarray(0, 6).toString('ascii').startsWith('GIF8')) return 'image/gif';
   if (buf.subarray(0, 4).toString('ascii') === 'RIFF' && buf.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  if (buf.subarray(4, 8).toString('ascii') === 'ftyp' && /^avi[fs]$/.test(buf.subarray(8, 12).toString('ascii'))) return 'image/avif';
+  // BMP: "BM" plus a known header size, so a text file starting with "BM" is not mistaken for one.
+  if (buf.length > 26 && buf.subarray(0, 2).toString('ascii') === 'BM' && [12, 40, 52, 56, 64, 108, 124].includes(buf.readUInt32LE(14))) return 'image/bmp';
+  // SVG is text: served back with a sandboxed Content-Security-Policy, so scripts inside it can never run.
+  const head = buf.subarray(0, 2048).toString('utf8').replace(/^\uFEFF/, '').trimStart();
+  if (/^(<\?xml|<svg|<!--|<!doctype svg)/i.test(head) && head.includes('<svg')) return 'image/svg+xml';
   return null;
 }
 
@@ -60,7 +66,7 @@ function readImage(req) {
   const f = req.file;
   if (!f) throw bad('Choose an image to upload');
   const mime = sniff(f.buffer);
-  if (!mime || !IMAGE.test(f.mimetype)) throw bad('Upload a PNG, JPG, GIF or WebP image');
+  if (!mime || !IMAGE.test(mime)) throw bad('Upload a PNG, JPG, GIF, WebP, AVIF, SVG or BMP image');
   return { buffer: f.buffer, mime, name: (f.originalname || 'image').replace(/[^\w.-]/g, '_').slice(0, 80) };
 }
 
@@ -117,7 +123,8 @@ media.get('/:id', ah(async (req, res) => {
     'Content-Type': m.mime,
     'Cache-Control': 'public, max-age=31536000, immutable',
     'X-Content-Type-Options': 'nosniff',
-    'Content-Security-Policy': "default-src 'none'; img-src 'self'; sandbox",
+    // SVGs may use inline styles and embedded (data:) images; the sandbox still blocks any script.
+    'Content-Security-Policy': "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; font-src data:; sandbox",
     'Cross-Origin-Resource-Policy': 'cross-origin',
   });
   res.send(m.bytes);

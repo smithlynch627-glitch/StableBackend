@@ -6,7 +6,7 @@ import { one, q } from '../db.js';
 import { bad } from './http.js';
 import { ERC721_ABI_MIN, getProvider, isLaunchpadCollection, market } from './chain.js';
 import { refreshCollectionStats } from './stats.js';
-import { slugify, syncCollectionFromChain, applyCollectionFlags, computeRarity } from '../indexer/core.js';
+import { slugify, syncCollectionFromChain, applyCollectionFlags, computeRarity, ipfsToHttp, metadataMedia } from '../indexer/core.js';
 
 const lc = (v) => String(v || '').toLowerCase();
 
@@ -117,7 +117,7 @@ export async function importCollection(address, maxTokens = 5000) {
          on conflict (collection, token_id) do update set owner = excluded.owner,
            name = coalesce(excluded.name, tokens.name), image_url = coalesce(excluded.image_url, tokens.image_url),
            attributes = case when jsonb_array_length(excluded.attributes) > 0 then excluded.attributes else tokens.attributes end`,
-        [a, id, owner, typeof meta.name === 'string' ? meta.name.slice(0, 120) : null, it.image_url || meta.image || null,
+        [a, id, owner, typeof meta.name === 'string' ? meta.name.slice(0, 120) : null, metadataMedia(meta) || ipfsToHttp(it.image_url || it.animation_url || null) || null,
           JSON.stringify(Array.isArray(meta.attributes) ? meta.attributes.slice(0, 50) : [])],
       );
       imported++;

@@ -86,6 +86,8 @@ export async function publicConfig() {
     mintFeeBps: fees.mintFeeBps ?? null,
     official: { address: config.officialCollection || null, slug: config.officialSlug },
     ipfsUploads: Boolean(config.pinataJwt),
+    // The site loads IPFS images through this gateway first (e.g. your Pinata dedicated gateway), then public ones.
+    ipfsGateway: /^https:\/\/[^\s]+$/.test(process.env.IPFS_GATEWAY || '') ? process.env.IPFS_GATEWAY.replace(/\/?$/, '/') : null,
     socials: await publicSocials(),
   };
 }

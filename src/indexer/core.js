@@ -646,12 +646,27 @@ function displayName(name, tokenId) {
   return new RegExp(`(^|\\D)${id}(\\D|$)`).test(n) ? n : `${n} #${id}`;
 }
 
+/**
+ * The picture for a token, in any format a browser can show: "image" (PNG, JPG, GIF, WebP, AVIF, SVG, BMP,
+ * or a video file), "image_url", on-chain SVG in "image_data", or the "animation_url" when there is no image.
+ */
+export function metadataMedia(meta) {
+  if (!meta || typeof meta !== 'object') return null;
+  const pick = [meta.image, meta.image_url, meta.imageUrl].find((v) => typeof v === 'string' && v.trim());
+  if (pick) return ipfsToHttp(pick.trim());
+  if (typeof meta.image_data === 'string' && meta.image_data.includes('<svg')) {
+    return `data:image/svg+xml;base64,${Buffer.from(meta.image_data).toString('base64')}`;
+  }
+  if (typeof meta.animation_url === 'string' && meta.animation_url.trim()) return ipfsToHttp(meta.animation_url.trim());
+  return null;
+}
+
 export async function fetchMetadata(collection, tokenId) {
   const uri = await collectionContract(collection).tokenURI(tokenId);
   const meta = await fetchJsonUri(uri);
   await q(
     `update tokens set name = coalesce($3, name), image_url = $4, attributes = $5 where collection = $1 and token_id = $2`,
-    [collection, tokenId, displayName(meta.name, tokenId), ipfsToHttp(meta.image || meta.image_url || null),
+    [collection, tokenId, displayName(meta.name, tokenId), metadataMedia(meta),
       JSON.stringify(Array.isArray(meta.attributes) ? meta.attributes.filter((a) => a && a.trait_type !== undefined).slice(0, 50) : [])],
   );
 }
