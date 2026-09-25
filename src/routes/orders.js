@@ -59,9 +59,19 @@ r.get('/:hash', ah(async (req, res) => {
 r.post('/sync', ah(async (req, res) => {
   const hash = String(req.body?.txHash || '');
   if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) throw bad('Invalid transaction hash');
-  const receipt = await getProvider().getTransactionReceipt(hash);
-  if (!receipt) throw bad('Transaction not confirmed yet');
-  res.json(await processLogs(receipt.logs));
+  // The wallet saw the receipt on one RPC node; the node we reach may be a block behind, so retry briefly.
+  let receipt = null;
+  for (let i = 0; i < 8 && !receipt; i++) {
+    receipt = await getProvider().getTransactionReceipt(hash).catch(() => null);
+    if (!receipt) await new Promise((r) => setTimeout(r, 400));
+  }
+  if (!receipt) return res.status(202).json({ queued: true }); // the indexer picks it up within seconds
+  try {
+    res.json(await processLogs(receipt.logs));
+  } catch (e) {
+    console.warn('[sync]', hash, e.message);
+    res.status(202).json({ queued: true });
+  }
 }));
 
 export default r;

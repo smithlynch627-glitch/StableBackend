@@ -5,7 +5,7 @@ import { config, ZERO_ADDRESS } from '../config.js';
 import { many, one, q } from '../db.js';
 import { COLLECTION_ABI, FACTORY_ABI, MARKET_ABI, collectionContract, getProvider, market as marketContract } from '../lib/chain.js';
 import { refreshCollectionStats } from '../lib/stats.js';
-import { assertPublicUrl } from '../lib/safeFetch.js';
+import { assertPublicUrl, safeGet } from '../lib/safeFetch.js';
 
 const colIface = new Interface(COLLECTION_ABI);
 const marketIface = new Interface(MARKET_ABI);
@@ -44,9 +44,18 @@ export async function phaseTxContext(address, txHash) {
   return { txHash: lc(txHash), ts: await blockTime(receipt.blockNumber) };
 }
 
-async function blockTime(n) {
+/**
+ * Timestamp of a block. The public RPC is load-balanced, so the node answering can be a block or two behind
+ * the one that returned the log/receipt: retry briefly, and never let a missing header stop indexing.
+ */
+export async function blockTime(n) {
   if (!blockTimes.has(n)) {
-    const b = await getProvider().getBlock(n);
+    let b = null;
+    for (let i = 0; i < 6 && !b; i++) {
+      b = await getProvider().getBlock(n).catch(() => null);
+      if (!b) await new Promise((r) => setTimeout(r, 250 * (i + 1)));
+    }
+    if (!b) return new Date();
     blockTimes.set(n, new Date(Number(b.timestamp) * 1000));
     if (blockTimes.size > 5000) blockTimes.delete(blockTimes.keys().next().value);
   }
@@ -385,15 +394,22 @@ async function onTransfer(collection, from, to, tokenId, txHash, logIndex, ts, s
      where collection = $1 and token_id = $2 and kind = 'listing' and status = 'active' and maker <> $3`,
     [collection, tokenId, to],
   );
-  if (isMint) queueMetadata(collection, tokenId);
+  if (isMint) {
+    const t = await one(`select image_url from tokens where collection = $1 and token_id = $2`, [collection, tokenId]);
+    if (!t?.image_url) queueMetadata(collection, tokenId);
+  }
 }
 
 // ── Metadata (tokenURI → JSON) ────────────────────────────────────────────────
 const queue = [];
+const pending = new Set();
 let running = false;
 const touchedForRarity = new Set();
 
 export function queueMetadata(collection, tokenId, attempt = 0) {
+  const key = `${collection}:${tokenId}`;
+  if (attempt === 0 && pending.has(key)) return; // already queued or waiting for a retry
+  pending.add(key);
   queue.push([collection, tokenId, attempt]);
   if (!running) drain();
 }
@@ -401,16 +417,21 @@ export function queueMetadata(collection, tokenId, attempt = 0) {
 async function drain() {
   running = true;
   while (queue.length) {
-    const batch = queue.splice(0, 8);
+    const batch = queue.splice(0, 4); // public IPFS gateways rate-limit bursts
     await Promise.all(
       batch.map(async ([c, id, attempt]) => {
+        const key = `${c}:${id}`;
         try {
           await fetchMetadata(c, id);
           touchedForRarity.add(c);
+          pending.delete(key);
         } catch (e) {
-          // IPFS content can take a while to propagate after an upload: retry with backoff.
-          if (attempt < 4) setTimeout(() => queueMetadata(c, id, attempt + 1), 15_000 * 2 ** attempt).unref?.();
-          else console.warn('[metadata]', c, id, e.message);
+          // New IPFS uploads take a while to spread and gateways rate-limit: retry with backoff (up to ~30 min).
+          if (attempt < 6) setTimeout(() => queueMetadata(c, id, attempt + 1), Math.min(15_000 * 2 ** attempt, 600_000)).unref?.();
+          else {
+            pending.delete(key);
+            console.warn('[metadata]', c, id, e.message);
+          }
         }
       }),
     );
@@ -422,10 +443,28 @@ async function drain() {
   }
 }
 
+/** Safety net: tokens still without metadata (e.g. every gateway was busy) are queued again, a few at a time. */
+export async function backfillMetadata(limit = 40) {
+  const rows = await many(
+    `select collection, token_id::text as id from tokens
+     where image_url is null and owner is not null and minted_at > now() - interval '30 days'
+     order by minted_at desc limit $1`,
+    [limit],
+  );
+  rows.forEach((r) => queueMetadata(r.collection, r.id));
+  return rows.length;
+}
+
 /** Gateways tried in order. IPFS_GATEWAY (e.g. your dedicated Pinata gateway) goes first. */
-const GATEWAYS = [process.env.IPFS_GATEWAY, 'https://ipfs.io/ipfs/', 'https://dweb.link/ipfs/', 'https://gateway.pinata.cloud/ipfs/']
+const GATEWAYS = [process.env.IPFS_GATEWAY, 'https://ipfs.io/ipfs/', 'https://w3s.link/ipfs/', 'https://dweb.link/ipfs/', 'https://4everland.io/ipfs/', 'https://gateway.pinata.cloud/ipfs/']
   .filter(Boolean)
   .map((g) => (g.endsWith('/') ? g : `${g}/`));
+const coolDown = new Map(); // gateway → time it may be used again (after HTTP 429)
+const gatewayOrder = () => {
+  const now = Date.now();
+  const ok = GATEWAYS.filter((g) => !(coolDown.get(g) > now));
+  return ok.length ? ok : GATEWAYS;
+};
 
 const ipfsPath = (uri) => fixIpfsPath(uri.slice(7).replace(/^ipfs\//, ''));
 /**
@@ -498,11 +537,18 @@ async function probeOnce(uri, timeout) {
 export async function fetchJsonUri(uri, { timeout = 12_000, maxBytes = 1_000_000 } = {}) {
   if (uri.startsWith('data:application/json;base64,')) return JSON.parse(Buffer.from(uri.split(',')[1], 'base64').toString('utf8'));
   if (uri.startsWith('data:application/json')) return JSON.parse(decodeURIComponent(uri.split(',').slice(1).join(',')));
-  const urls = uri.startsWith('ipfs://') ? GATEWAYS.map((g) => ipfsToHttp(uri, g)) : [ipfsToHttp(uri)];
+  const gws = uri.startsWith('ipfs://') ? gatewayOrder() : [null];
   let last;
-  for (const url of urls) {
+  for (const g of gws) {
+    const url = g ? ipfsToHttp(uri, g) : ipfsToHttp(uri);
     try {
+      if (!g && !url.startsWith('https://arweave.net/')) {
+        // A creator-controlled web link: fetched with SSRF protection (public https hosts only, safe redirects).
+        const { buf } = await safeGet(url, { timeout, maxBytes, accept: 'application/json' });
+        return JSON.parse(buf.toString('utf8'));
+      }
       const res = await fetch(url, { signal: AbortSignal.timeout(timeout), headers: { accept: 'application/json' } });
+      if (res.status === 429 && g) coolDown.set(g, Date.now() + 60_000);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const buf = Buffer.from(await res.arrayBuffer());
       if (buf.length > maxBytes) throw new Error('metadata file too large');
