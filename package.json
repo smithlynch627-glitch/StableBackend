@@ -1,0 +1,33 @@
+{
+  "name": "giwa-market-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "indexer": "node src/indexer/run.js",
+    "db:init": "node scripts/init-db.js",
+    "db:clear": "node scripts/clear-db.js",
+    "db:test": "node scripts/test-db.js"
+  },
+  "dependencies": {
+    "@expo-google-fonts/inter": "^0.2.3",
+    "@openzeppelin/merkle-tree": "^1.0.8",
+    "@resvg/resvg-js": "^2.6.2",
+    "compression": "^1.8.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "ethers": "^6.13.5",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.13.3",
+    "zod": "^3.24.2"
+  }
+}
