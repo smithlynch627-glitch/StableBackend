@@ -3,6 +3,8 @@ import { readFileSync, existsSync } from 'node:fs';
 
 const addr = (v) => (v ? String(v).trim().toLowerCase() : '');
 const list = (v) => String(v || '').split(',').map(addr).filter(Boolean);
+// Site addresses: a trailing "/" or capital letters would never match the browser's Origin header, so normalise them.
+const origins = (v, fallback) => String(v || fallback).split(',').map((s) => s.trim().replace(/\/+$/, '').toLowerCase()).filter(Boolean);
 
 function readCa(v) {
   if (!v) return null;
@@ -20,9 +22,9 @@ export const config = {
   databaseUrl: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/giwa_market',
   databaseCa: readCa(process.env.DATABASE_CA_CERT),
   jwtSecret: process.env.JWT_SECRET || '',
-  corsOrigins: (process.env.CORS_ORIGINS || 'http://localhost:5173').split(',').map((s) => s.trim()).filter(Boolean),
+  corsOrigins: origins(process.env.CORS_ORIGINS, 'http://localhost:5173'),
   // The separate admin site(s). /api/admin only answers requests coming from these origins.
-  adminOrigins: (process.env.ADMIN_ORIGINS || 'http://localhost:5174').split(',').map((s) => s.trim()).filter(Boolean),
+  adminOrigins: origins(process.env.ADMIN_ORIGINS, 'http://localhost:5174'),
   apiPublicUrl: (process.env.API_PUBLIC_URL || `http://localhost:${process.env.PORT || 8080}`).replace(/\/$/, ''),
   rootAdmins: list(process.env.ADMIN_ADDRESSES).filter((a) => /^0x[0-9a-f]{40}$/.test(a)),
   encryptionKey: process.env.DATA_ENCRYPTION_KEY || '',
@@ -61,6 +63,7 @@ if (!config.jwtSecret || config.jwtSecret.length < 32) {
   if (invalid.length) console.warn(`[config] ADMIN_ADDRESSES has invalid entries (ignored): ${invalid.join(', ')}`);
   const shown = config.rootAdmins.map((a) => `${a.slice(0, 6)}…${a.slice(-4)}`).join(', ');
   console.log(`[config] root admin wallets from ADMIN_ADDRESSES: ${shown || 'none set'}`);
+  console.log(`[config] website origins: ${config.corsOrigins.join(', ')} | admin origins: ${config.adminOrigins.join(', ')}`);
 }
 if (!config.encryptionKey) console.warn('[config] DATA_ENCRYPTION_KEY is not set. Support contact details will not be stored.');
 

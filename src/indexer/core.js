@@ -15,6 +15,7 @@ const TOPIC = {
   approvalForAll: T(colIface, 'ApprovalForAll'),
   minted: T(colIface, 'Minted'),
   phaseUpdated: T(colIface, 'PhaseUpdated'),
+  phasesUpdated: T(colIface, 'PhasesUpdated'),
   revealed: T(colIface, 'Revealed'),
   baseUri: T(colIface, 'BaseURIUpdated'),
   unrevealed: T(colIface, 'UnrevealedURIUpdated'),
@@ -27,6 +28,20 @@ const TOPIC = {
 
 const lc = (v) => String(v).toLowerCase();
 const blockTimes = new Map();
+
+/**
+ * When the Studio saves phases it sends the transaction hash; if that transaction really changed this
+ * collection's phases, the change log entry gets the hash (and block time) so the mint page can link to it.
+ */
+export async function phaseTxContext(address, txHash) {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(String(txHash || ''))) return null;
+  const receipt = await getProvider().getTransactionReceipt(txHash).catch(() => null);
+  if (!receipt || receipt.status !== 1) return null;
+  const topics = new Set([TOPIC.phasesUpdated, TOPIC.phaseUpdated]);
+  const hit = receipt.logs.find((l) => lc(l.address) === lc(address) && topics.has(l.topics[0]));
+  if (!hit) return null;
+  return { txHash: lc(txHash), ts: await blockTime(receipt.blockNumber) };
+}
 
 async function blockTime(n) {
   if (!blockTimes.has(n)) {
@@ -45,7 +60,7 @@ export const slugify = (s) =>
   String(s).toLowerCase().normalize('NFKD').replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'collection';
 
 /** Reads a launchpad collection from the chain and upserts it. Keeps off-chain metadata (images, text). */
-export async function syncCollectionFromChain(address, creator = null, createdAt = new Date()) {
+export async function syncCollectionFromChain(address, creator = null, createdAt = new Date(), ctx = null) {
   const c = collectionContract(address);
   const [name, symbol, owner, maxSupply, totalSupply, phases, royalty, revealed, frozen, paused, contractUri] = await Promise.all([
     c.name(), c.symbol(), c.owner(), c.maxSupply(), c.totalSupply(), c.getPhases(),
@@ -65,18 +80,35 @@ export async function syncCollectionFromChain(address, creator = null, createdAt
     [address, config.chainId, slug, name, symbol, lc(creator || owner), Number(royalty[1]), lc(royalty[0]), Number(maxSupply), Number(totalSupply), createdAt,
       revealed, frozen, paused, contractUri || null],
   );
-  await syncPhases(address, phases);
+  await syncPhases(address, phases, ctx);
   await applyCollectionFlags();
 }
 
-/** Phase numbers always come from the contract; names and allowlist ids are kept from the creator's metadata. */
-export async function syncPhases(address, phases) {
-  const list = phases ?? (await collectionContract(address).getPhases());
+const ZERO_ROOT = '0x' + '0'.repeat(64);
+const gated = (root) => Boolean(root) && lc(root) !== ZERO_ROOT;
+
+/**
+ * Phase numbers always come from the contract; names and allowlist ids are kept from the creator's metadata.
+ * v2 collections have stable phase ids, so names follow a phase even when a new phase is inserted above Public.
+ * When the configuration changes after minting started, the change is recorded for the mint-page alert.
+ */
+export async function syncPhases(address, phases, ctx = null) {
+  const c = collectionContract(address);
+  const list = phases ?? (await c.getPhases());
+  const ids = (await c.phaseIds().catch(() => null))?.map(Number) ?? null;
   const prev = await one(`select phases from drops where collection = $1`, [address]);
+  const before = prev?.phases || [];
   const merged = list.map((p, i) => {
-    const old = prev?.phases?.[i] || {};
+    const id = ids ? ids[i] : null;
+    const old = (id != null ? before.find((b) => b.id === id) : before[i]) || {};
+    const isLast = i === list.length - 1;
+    const open = !gated(p.merkleRoot);
+    let name = old.name || defaultPhaseName(p, i, list.length);
+    if (isLast && open) name = 'Public';
+    else if (/^public$/i.test(name)) name = open ? `Phase ${i + 1}` : 'Allowlist';
     return {
-      name: old.name || defaultPhaseName(p, i, list.length),
+      id,
+      name,
       start: new Date(Number(p.startTime) * 1000).toISOString(),
       end: Number(p.endTime) ? new Date(Number(p.endTime) * 1000).toISOString() : null,
       priceWei: p.price.toString(),
@@ -85,18 +117,62 @@ export async function syncPhases(address, phases) {
       allowlistId: old.merkleRoot && old.merkleRoot === lc(p.merkleRoot) ? old.allowlistId ?? null : null,
     };
   });
-  const fee = await collectionContract(address).platformFeeBps().catch(() => 1000);
+  const fee = await c.platformFeeBps().catch(() => 1000);
   await q(
     `insert into drops (collection, phases, platform_fee_bps) values ($1,$2,$3)
      on conflict (collection) do update set phases = excluded.phases, platform_fee_bps = excluded.platform_fee_bps`,
     [address, JSON.stringify(merged), Number(fee)],
   );
+  if (before.length) {
+    const changes = diffPhases(before, merged);
+    if (changes.length) await logConfigChange(address, before, changes, ctx);
+  }
+  return merged;
+}
+
+/** Human-readable list of what changed between two phase configurations. */
+export function diffPhases(before, after) {
+  const out = [];
+  const matched = new Set();
+  const byId = before.every((b) => b.id != null) && after.every((a) => a.id != null);
+  after.forEach((a, i) => {
+    const b = byId ? before.find((x) => x.id === a.id) : before[i];
+    if (!b) {
+      out.push({ type: 'added', phase: a.name, after: summary(a) });
+      return;
+    }
+    matched.add(b);
+    const label = a.name || b.name;
+    const field = (key, from, to) => out.push({ type: 'changed', phase: label, field: key, from, to });
+    if (b.priceWei !== a.priceWei) field('price', b.priceWei, a.priceWei);
+    if (b.start !== a.start) field('start', b.start, a.start);
+    if ((b.end || null) !== (a.end || null)) field('end', b.end || null, a.end || null);
+    if ((b.maxPerWallet || null) !== (a.maxPerWallet || null)) field('maxPerWallet', b.maxPerWallet || null, a.maxPerWallet || null);
+    if (lc(b.merkleRoot || ZERO_ROOT) !== lc(a.merkleRoot || ZERO_ROOT)) {
+      field('allowlist', gated(b.merkleRoot) ? 'allowlist' : 'open', gated(a.merkleRoot) ? (gated(b.merkleRoot) ? 'updated' : 'allowlist') : 'open');
+    }
+  });
+  before.filter((b) => !matched.has(b)).forEach((b) => out.push({ type: 'removed', phase: b.name, before: summary(b) }));
+  return out;
 }
 
 function defaultPhaseName(p, i, count) {
-  if (p.merkleRoot !== '0x' + '0'.repeat(64)) return 'Allowlist';
+  if (gated(p.merkleRoot)) return 'Allowlist';
   if (i === count - 1) return 'Public';
   return `Phase ${i + 1}`;
+}
+
+const summary = (p) => ({ start: p.start, end: p.end || null, priceWei: p.priceWei, maxPerWallet: p.maxPerWallet || null, allowlist: gated(p.merkleRoot) });
+
+/** Records a mint-configuration change, but only once minting had started (first phase start passed). */
+export async function logConfigChange(address, phasesBefore, changes, ctx) {
+  const at = ctx?.ts || new Date();
+  const firstStart = Math.min(...(phasesBefore || []).map((p) => new Date(p.start).getTime()).filter(Number.isFinite));
+  if (!Number.isFinite(firstStart) || at.getTime() < firstStart) return;
+  await q(
+    `insert into phase_changes (collection, tx_hash, changes, changed_at) values ($1,$2,$3,$4) on conflict do nothing`,
+    [address, ctx?.txHash || null, JSON.stringify(changes), at],
+  );
 }
 
 /** Official GIWA COWS + verified badges come from server config, never from users. */
@@ -156,15 +232,26 @@ export async function processLogs(logs) {
         const each = qty ? ev.args.paid / BigInt(qty) : 0n;
         for (let i = 0; i < qty; i++) mintPrice.set(`${address}:${(ev.args.firstTokenId + BigInt(i)).toString()}`, each.toString());
         if (ev.args.platformFee > 0n) {
-          await q(`insert into fee_ledger (source, collection, amount_wei, tx_hash) values ('mint',$1,$2,$3)`, [address, ev.args.platformFee.toString(), txHash]);
+          await q(
+            `insert into fee_ledger (source, collection, amount_wei, tx_hash, log_index) values ('mint',$1,$2,$3,$4) on conflict do nothing`,
+            [address, ev.args.platformFee.toString(), txHash, log.index],
+          );
         }
-      } else if (topic === TOPIC.phaseUpdated) {
-        await syncPhases(address);
+      } else if (topic === TOPIC.phaseUpdated || topic === TOPIC.phasesUpdated) {
+        await syncPhases(address, null, { ts, txHash });
       } else if ([TOPIC.revealed, TOPIC.baseUri, TOPIC.unrevealed, TOPIC.batchMeta].includes(topic)) {
         if (topic === TOPIC.revealed) await q(`update collections set revealed = true where address = $1`, [address]);
         const ids = await many(`select token_id::text as id from tokens where collection = $1 order by token_id limit 20000`, [address]);
         ids.forEach((r) => queueMetadata(address, r.id));
       } else if ([TOPIC.frozen, TOPIC.mintPaused, TOPIC.contractUri, TOPIC.supplyReduced].includes(topic)) {
+        if (topic === TOPIC.mintPaused || topic === TOPIC.supplyReduced) {
+          const ev = parse(colIface, log);
+          const d = await one(`select phases from drops where collection = $1`, [address]);
+          const change = topic === TOPIC.mintPaused
+            ? { type: ev?.args.paused ? 'paused' : 'resumed' }
+            : { type: 'supply', to: ev ? Number(ev.args.maxSupply) : null };
+          if (d) await logConfigChange(address, d.phases, [change], { ts, txHash: `${txHash}:${log.index}` }).catch(() => {});
+        }
         await syncCollectionFromChain(address).catch((e) => console.warn('[sync]', address, e.message));
       } else if (topic === TOPIC.approvalForAll) {
         const ev = parse(colIface, log);
@@ -256,7 +343,10 @@ async function onOrderFilled(ev, log, txHash, ts, known) {
     await q(`update tokens set last_sale_wei = $3 where collection = $1 and token_id = $2`, [collection, tokenId, price]);
     await q(`update collections set volume_wei = volume_wei + $2, sales_count = sales_count + 1 where address = $1`, [collection, price]);
     if (ev.args.fee > 0n) {
-      await q(`insert into fee_ledger (source, collection, amount_wei, tx_hash) values ('trade',$1,$2,$3)`, [collection, ev.args.fee.toString(), txHash]);
+      await q(
+        `insert into fee_ledger (source, collection, amount_wei, tx_hash, log_index) values ('trade',$1,$2,$3,$4) on conflict do nothing`,
+        [collection, ev.args.fee.toString(), txHash, log.index],
+      );
     }
   }
   return collection;

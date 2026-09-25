@@ -3,7 +3,7 @@ import { config, contractsReady } from '../config.js';
 import { one, q } from '../db.js';
 import { loadNetwork } from '../lib/network.js';
 import { getProvider } from '../lib/chain.js';
-import { expireOrders, refreshAllStats } from '../lib/stats.js';
+import { expireOrders, refreshAllStats, takeSnapshots } from '../lib/stats.js';
 import { applyCollectionFlags, knownCollections, processLogs } from './core.js';
 
 const CHUNK = 2000;
@@ -15,6 +15,32 @@ async function getCursor() {
 }
 const setCursor = (n) =>
   q(`insert into indexer_state (key, value) values ('last_block', $1) on conflict (key) do update set value = excluded.value`, [String(n)]);
+
+/**
+ * After a contract upgrade (new marketplace / factory addresses):
+ *  - listings and offers signed for the old marketplace can no longer be filled, so they are retired;
+ *  - the indexer re-reads from the network's start block, so nothing created on the new contracts is missed.
+ *    Re-reading is safe: every write is idempotent (activity and fees are keyed by transaction log).
+ */
+async function checkContractsChanged() {
+  const key = `${config.market}|${config.factory}`;
+  const row = await one(`select value from indexer_state where key = 'contracts'`);
+  if (row?.value === key) return;
+  if (row) {
+    const [oldMarket] = row.value.split('|');
+    if (oldMarket !== config.market) {
+      const n = await q(`update orders set status = 'inactive', updated_at = now() where status = 'active'`);
+      console.log(`[indexer] marketplace changed: retired ${n.rowCount} orders signed for the previous marketplace`);
+    }
+    const cursor = await getCursor();
+    if (config.indexerStartBlock > 0 && cursor >= config.indexerStartBlock) {
+      await setCursor(config.indexerStartBlock - 1);
+      console.log(`[indexer] contracts changed: re-reading from block ${config.indexerStartBlock}`);
+    }
+    await refreshAllStats();
+  }
+  await q(`insert into indexer_state (key, value) values ('contracts', $1) on conflict (key) do update set value = excluded.value`, [key]);
+}
 
 async function tick() {
   const provider = getProvider();
@@ -63,10 +89,12 @@ async function main() {
         await sleep(config.indexerPollMs);
         continue;
       }
+      await checkContractsChanged();
       await tick();
       if (Date.now() - lastMaintenance > 60_000) {
         const expired = await expireOrders();
         await refreshAllStats();
+        await takeSnapshots().catch((e) => console.warn('[snapshots]', e.message));
         lastMaintenance = Date.now();
         if (expired) console.log(`[indexer] expired ${expired} orders`);
       }

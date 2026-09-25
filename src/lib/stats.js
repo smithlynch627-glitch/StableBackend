@@ -33,3 +33,15 @@ export async function refreshAllStats() {
   const { rows } = await q(`select address from collections`);
   for (const r of rows) await refreshCollectionStats(r.address);
 }
+
+/** One row per collection per hour (the latest values in that hour) for the analytics charts. */
+export async function takeSnapshots() {
+  await q(
+    `insert into snapshots (collection, taken_at, floor_wei, best_offer_wei, listed_count, owners_count, volume_wei, sales_count)
+     select address, date_trunc('hour', now()), floor_wei, best_offer_wei, listed_count, owners_count, volume_wei, sales_count
+     from collections where not hidden
+     on conflict (collection, taken_at) do update set floor_wei = excluded.floor_wei, best_offer_wei = excluded.best_offer_wei,
+       listed_count = excluded.listed_count, owners_count = excluded.owners_count, volume_wei = excluded.volume_wei,
+       sales_count = excluded.sales_count`,
+  );
+}

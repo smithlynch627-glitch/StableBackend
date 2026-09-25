@@ -4,7 +4,7 @@ import { Contract } from 'ethers';
 import { config } from '../config.js';
 import { one, q } from '../db.js';
 import { bad } from './http.js';
-import { ERC721_ABI_MIN, factory, getProvider, market } from './chain.js';
+import { ERC721_ABI_MIN, getProvider, isLaunchpadCollection, market } from './chain.js';
 import { refreshCollectionStats } from './stats.js';
 import { slugify, syncCollectionFromChain, applyCollectionFlags, computeRarity } from '../indexer/core.js';
 
@@ -64,7 +64,7 @@ export async function importCollection(address, maxTokens = 5000) {
   const provider = getProvider();
   if ((await provider.getCode(a)) === '0x') throw bad('No contract at this address on the active network');
 
-  const fromLaunchpad = config.factory ? await factory().isCollection(a).catch(() => false) : false;
+  const fromLaunchpad = await isLaunchpadCollection(a);
   if (fromLaunchpad) {
     await syncCollectionFromChain(a);
   } else {

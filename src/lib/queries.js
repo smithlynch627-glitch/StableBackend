@@ -21,11 +21,14 @@ export const BEST_LISTING_JOIN = `left join lateral (
   where o.collection = t.collection and o.token_id = t.token_id and o.kind = 'listing' and o.status = 'active'
   order by o.price_wei asc limit 1) l on true`;
 
+/** Long "About" fields are only sent with a single collection, never in lists. */
+const ABOUT_COLS = `c.about, c.about_image_url, c.about_items`;
+
 export async function loadCollection(key, { includeHidden = false } = {}) {
   const k = String(key).toLowerCase();
   const col = isAddress(k)
-    ? await one(`select ${COLLECTION_COLS} from collections c where c.address = $1`, [k])
-    : await one(`select ${COLLECTION_COLS} from collections c where c.slug = $1`, [k]);
+    ? await one(`select ${COLLECTION_COLS}, ${ABOUT_COLS} from collections c where c.address = $1`, [k])
+    : await one(`select ${COLLECTION_COLS}, ${ABOUT_COLS} from collections c where c.slug = $1`, [k]);
   if (!col || (col.hidden && !includeHidden)) throw notFound('Collection not found');
   return col;
 }
@@ -35,7 +38,12 @@ export async function loadDrop(col) {
   const d = await one(`select phases, platform_fee_bps, featured from drops where collection = $1`, [col.address]);
   if (!d) return null;
   const phases = d.phases.map(({ allowlistId, merkleRoot, ...p }) => ({ ...p, hasAllowlist: Boolean(merkleRoot && !/^0x0+$/.test(merkleRoot)) }));
-  return { ...dropState(phases, col.total_supply, col.max_supply), platformFeeBps: d.platform_fee_bps, featured: d.featured };
+  // Configuration edits made after minting started (the mint page shows an alert with the details).
+  const changes = await many(
+    `select id, tx_hash, changes, changed_at from phase_changes where collection = $1 order by changed_at desc, id desc limit 20`,
+    [col.address],
+  ).catch(() => []);
+  return { ...dropState(phases, col.total_supply, col.max_supply), platformFeeBps: d.platform_fee_bps, featured: d.featured, changes };
 }
 
 export async function traitCounts(collection) {

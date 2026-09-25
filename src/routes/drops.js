@@ -6,8 +6,8 @@ import { addrParam, ah, bad, clampInt, forbidden } from '../lib/http.js';
 import { requireAuth } from '../lib/auth.js';
 import { COLLECTION_COLS, loadCollection, loadDrop } from '../lib/queries.js';
 import { dropState } from '../lib/drops.js';
-import { collectionContract, factory } from '../lib/chain.js';
-import { syncCollectionFromChain } from '../indexer/core.js';
+import { collectionContract, isLaunchpadCollection } from '../lib/chain.js';
+import { phaseTxContext, syncCollectionFromChain } from '../indexer/core.js';
 
 const r = Router();
 const publicPhases = (phases) => phases.map(({ allowlistId, merkleRoot, ...p }) => ({ ...p, hasAllowlist: Boolean(merkleRoot && !/^0x0+$/.test(merkleRoot)) }));
@@ -85,11 +85,11 @@ r.post('/allowlists', requireAuth, ah(async (req, res) => {
 r.post('/', requireAuth, ah(async (req, res) => {
   const b = req.body || {};
   const address = addrParam(b.collection, 'collection');
-  if (!(await factory().isCollection(address))) throw bad('This contract was not created by the launchpad');
+  if (!(await isLaunchpadCollection(address))) throw bad('This contract was not created by the launchpad');
   const owner = String(await collectionContract(address).owner()).toLowerCase();
   if (owner !== req.user) throw forbidden('Only the collection owner can edit this drop');
 
-  await syncCollectionFromChain(address, owner);
+  await syncCollectionFromChain(address, owner, undefined, await phaseTxContext(address, b.txHash));
   // Only the fields that were sent are changed (the Studio sends partial updates).
   const fields = { description: 'description', imageUrl: 'image_url', bannerUrl: 'banner_url', twitter: 'twitter', website: 'website', discord: 'discord', telegram: 'telegram' };
   const sets = [];
@@ -103,14 +103,19 @@ r.post('/', requireAuth, ah(async (req, res) => {
 
   const d = await one(`select phases from drops where collection = $1`, [address]);
   const phases = d.phases;
+  const open = (p) => !p.merkleRoot || /^0x0+$/.test(p.merkleRoot);
   for (const [i, meta] of (b.phases || []).slice(0, phases.length).entries()) {
-    if (meta?.name) phases[i].name = String(meta.name).slice(0, 32);
+    if (meta?.name) phases[i].name = String(meta.name).trim().slice(0, 32) || phases[i].name;
+    // "Public" is reserved for the last phase, which is open to everyone.
+    if (/^public$/i.test(phases[i].name) && !(i === phases.length - 1 && open(phases[i]))) phases[i].name = `Phase ${i + 1}`;
     if (meta?.allowlistId) {
       const al = await one(`select root from allowlists where id = $1`, [meta.allowlistId]);
       if (!al || al.root.toLowerCase() !== phases[i].merkleRoot) throw bad(`Phase ${i + 1}: allowlist does not match the on-chain root`);
       phases[i].allowlistId = meta.allowlistId;
     }
   }
+  const last = phases[phases.length - 1];
+  if (last && open(last)) last.name = 'Public';
   await q(`update drops set phases = $2 where collection = $1`, [address, JSON.stringify(phases)]);
   res.json({ collection: await loadCollection(address) });
 }));

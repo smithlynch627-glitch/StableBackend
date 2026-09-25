@@ -207,6 +207,10 @@ begin
   -- upgrades for schemas created by an earlier version
   execute format('alter table %I.collections add column if not exists discord text', s);
   execute format('alter table %I.collections add column if not exists telegram text', s);
+  -- About tab (written by admins in the admin panel)
+  execute format('alter table %I.collections add column if not exists about text', s);
+  execute format('alter table %I.collections add column if not exists about_image_url text', s);
+  execute format($a$alter table %I.collections add column if not exists about_items jsonb not null default '[]'$a$, s);
   execute format('alter table %I.collections add column if not exists drop_hidden boolean not null default false', s);
   execute format('create index if not exists collections_volume_idx on %I.collections (volume_24h_wei desc)', s);
   execute format('create index if not exists collections_created_idx on %I.collections (created_at desc)', s);
@@ -302,12 +306,42 @@ begin
       created_at timestamptz not null default now()
     )$ddl$, s);
 
+  -- Fee ledger rows are keyed by log so re-indexing a block range never counts a fee twice.
+  execute format('alter table %I.fee_ledger add column if not exists log_index integer', s);
+  execute format('create unique index if not exists fee_ledger_log_uniq on %I.fee_ledger (tx_hash, log_index) where tx_hash is not null and log_index is not null', s);
+
+  -- Mint configuration edits made after minting started (shown as an alert on the mint page).
+  execute format($ddl$
+    create table if not exists %1$I.phase_changes (
+      id         bigserial primary key,
+      collection text not null references %1$I.collections(address) on delete cascade,
+      tx_hash    text,
+      changes    jsonb not null,
+      changed_at timestamptz not null default now()
+    )$ddl$, s);
+  execute format('create unique index if not exists phase_changes_tx on %I.phase_changes (collection, tx_hash) where tx_hash is not null', s);
+  execute format('create index if not exists phase_changes_time on %I.phase_changes (collection, changed_at desc)', s);
+
+  -- Hourly snapshots for analytics charts (floor history etc.).
+  execute format($ddl$
+    create table if not exists %1$I.snapshots (
+      collection     text not null references %1$I.collections(address) on delete cascade,
+      taken_at       timestamptz not null,
+      floor_wei      numeric(78,0),
+      best_offer_wei numeric(78,0),
+      listed_count   integer not null default 0,
+      owners_count   integer not null default 0,
+      volume_wei     numeric(78,0) not null default 0,
+      sales_count    integer not null default 0,
+      primary key (collection, taken_at)
+    )$ddl$, s);
+
   execute format('create table if not exists %I.indexer_state (key text primary key, value text not null)', s);
 
   -- Lock it down exactly like the app schema.
   execute format('revoke all on schema %I from public', s);
   execute format('grant usage on schema %I to stable_api', s);
-  foreach t in array array['collections','tokens','orders','activity','drops','allowlists','fee_ledger','indexer_state'] loop
+  foreach t in array array['collections','tokens','orders','activity','drops','allowlists','fee_ledger','indexer_state','phase_changes','snapshots'] loop
     execute format('alter table %I.%I enable row level security', s, t);
     execute format('drop policy if exists api_all on %I.%I', s, t);
     execute format('create policy api_all on %I.%I for all to stable_api using (true) with check (true)', s, t);

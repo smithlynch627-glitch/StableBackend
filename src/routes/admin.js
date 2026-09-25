@@ -75,6 +75,12 @@ r.get('/collections', requireRole('admin'), ah(async (req, res) => {
   res.json({ collections: rows });
 }));
 
+r.get('/collections/:address', requireRole('admin'), ah(async (req, res) => {
+  const row = await one(`select ${COLLECTION_COLS}, c.about, c.about_image_url, c.about_items from collections c where c.address = $1`, [addrParam(req.params.address)]);
+  if (!row) throw notFound('Collection not found');
+  res.json({ collection: row });
+}));
+
 r.patch('/collections/:address', requireRole('admin'), ah(async (req, res) => {
   const address = addrParam(req.params.address);
   const b = req.body || {};
@@ -89,6 +95,18 @@ r.patch('/collections/:address', requireRole('admin'), ah(async (req, res) => {
   if ('twitter' in b) set('twitter', url(b.twitter, 'X link'));
   if ('website' in b) set('website', url(b.website, 'website'));
   if ('discord' in b) set('discord', url(b.discord, 'Discord link'));
+  if ('about' in b) set('about', b.about ? String(b.about).slice(0, 8000) : null);
+  if ('about_image_url' in b) {
+    const v = String(b.about_image_url || '').trim();
+    set('about_image_url', /^ipfs:\/\/[^\s]{10,290}$/i.test(v) ? v : url(v, 'About image'));
+  }
+  if ('about_items' in b) {
+    if (!Array.isArray(b.about_items) || b.about_items.length > 12) throw bad('About details: up to 12 rows');
+    const items = b.about_items
+      .map((x) => ({ label: String(x?.label || '').trim().slice(0, 40), value: String(x?.value || '').trim().slice(0, 300) }))
+      .filter((x) => x.label && x.value);
+    set('about_items', JSON.stringify(items));
+  }
   if ('telegram' in b) set('telegram', url(b.telegram, 'Telegram link'));
   if (typeof b.slug === 'string') {
     if (!/^[a-z0-9-]{3,60}$/.test(b.slug)) throw bad('Slug must be 3-60 lowercase letters, numbers or dashes');
@@ -102,7 +120,7 @@ r.patch('/collections/:address', requireRole('admin'), ah(async (req, res) => {
   if (!row) throw notFound('Collection not found');
   if (typeof b.featured === 'boolean') await q(`update drops set featured = $2 where collection = $1`, [address, b.featured]);
   await audit(req, 'collection.update', address, b);
-  res.json({ collection: await one(`select ${COLLECTION_COLS} from collections c where c.address = $1`, [address]) });
+  res.json({ collection: await one(`select ${COLLECTION_COLS}, c.about, c.about_image_url, c.about_items from collections c where c.address = $1`, [address]) });
 }));
 
 /** Removes a collection (and its items, orders and activity) from the marketplace database. On-chain nothing changes. */

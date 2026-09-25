@@ -30,6 +30,7 @@ export const MARKET_ABI = [
   'function feeRecipient() view returns (address)',
   'function approvedCollections(address) view returns (bool)',
   'function blockedCollections(address) view returns (bool)',
+  'function factories() view returns (address[])',
   'event CollectionApprovalSet(address indexed collection, bool approved)',
   'event CollectionBlockedSet(address indexed collection, bool blocked)',
   'event OrderFilled(bytes32 indexed orderHash, address indexed maker, address indexed taker, uint8 side, address collection, uint256 tokenId, uint256 price, uint256 fee, uint256 royalty)',
@@ -61,10 +62,13 @@ export const COLLECTION_ABI = [
   'function contractURI() view returns (string)',
   'function supportsInterface(bytes4) view returns (bool)',
   'function getPhases() view returns (tuple(uint64 startTime, uint64 endTime, uint256 price, uint32 maxPerWallet, bytes32 merkleRoot)[])',
+  'function phaseIds() view returns (uint32[])',
+  'function version() view returns (uint256)',
   'event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)',
   'event ApprovalForAll(address indexed owner, address indexed operator, bool approved)',
   'event Minted(address indexed to, uint256 indexed phaseId, uint256 firstTokenId, uint256 quantity, uint256 paid, uint256 platformFee)',
   'event PhaseUpdated(uint256 indexed phaseId)',
+  'event PhasesUpdated(uint256 count)',
   'event Revealed(string baseURI)',
   'event BaseURIUpdated(string baseURI)',
   'event UnrevealedURIUpdated(string uri)',
@@ -88,6 +92,27 @@ export const ERC721_ABI_MIN = [
 export const market = () => new Contract(config.market, MARKET_ABI, getProvider());
 export const factory = () => new Contract(config.factory, FACTORY_ABI, getProvider());
 export const collectionContract = (address) => new Contract(address, COLLECTION_ABI, getProvider());
+
+/**
+ * True if a launchpad factory made this contract: the current factory, or any factory the marketplace accepts
+ * (after a contract upgrade, collections from the previous factory stay first-class).
+ */
+export async function isLaunchpadCollection(address) {
+  if (config.factory && (await factory().isCollection(address).catch(() => false))) return true;
+  if (!config.market) return false;
+  const list = await market().factories().catch(() => []);
+  for (const f of list) {
+    if (String(f).toLowerCase() === config.factory) continue;
+    const ok = await new Contract(f, FACTORY_ABI, getProvider()).isCollection(address).catch(() => false);
+    if (ok) return true;
+  }
+  return false;
+}
+
+/** Contract version of a collection: 2 = single-transaction phase editing, 1 = original. */
+export async function collectionVersion(address) {
+  return Number(await collectionContract(address).version().catch(() => 1n));
+}
 
 /** Fees read from the contracts (cached for 15 s) so the API never disagrees with the chain. */
 const feeCache = { at: 0, marketFeeBps: null, mintFeeBps: null };
