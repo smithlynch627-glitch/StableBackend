@@ -122,9 +122,11 @@ r.get('/:key/tokens', ah(async (req, res) => {
 r.get('/:key/offers', ah(async (req, res) => {
   const col = await loadCollection(req.params.key);
   const offers = await many(
-    `select hash, kind, token_id::text as token_id, maker, price_wei, currency, end_time, created_at
-     from orders where collection = $1 and kind in ('offer','collection_offer') and status = 'active'
-     order by price_wei desc limit 100`,
+    `select o.hash, o.kind, o.token_id::text as token_id, o.maker, o.price_wei, o.currency, o.end_time, o.created_at,
+       t.name as token_name, t.image_url as token_image, t.rarity_rank
+     from orders o left join tokens t on t.collection = o.collection and t.token_id = o.token_id
+     where o.collection = $1 and o.kind in ('offer','collection_offer') and o.status = 'active'
+     order by o.price_wei desc limit 100`,
     [col.address],
   );
   res.json({ offers });
