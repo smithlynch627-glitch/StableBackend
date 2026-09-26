@@ -60,7 +60,7 @@ function markBad(g, status) {
 }
 export const gatewayHealth = () => [...health.entries()].map(([g, h]) => ({ gateway: g, ...h }));
 
-async function readCapped(res, max) {
+export async function readCapped(res, max) {
   const len = Number(res.headers.get('content-length') || 0);
   if (len > max) throw new Error(`file too large (${len} bytes)`);
   if (!res.body) return Buffer.alloc(0);
@@ -274,11 +274,33 @@ function fileFromBlocks(cid, blocks, depth = 0) {
   return Buffer.concat(parts.map((p) => Buffer.from(p)));
 }
 
+// Memory guard: whole-folder archives are big, so only a couple download at a time (others wait their turn).
+const CAR_MAX_BYTES = Math.max(4, Number(process.env.IPFS_CAR_MAX_MB || 48)) * 1_000_000;
+const CAR_SLOTS = Math.max(1, Number(process.env.IPFS_CAR_PARALLEL || 2));
+let carActive = 0;
+const carQueue = [];
+async function carSlot(fn) {
+  if (carActive >= CAR_SLOTS) {
+    if (carQueue.length >= 50) throw new Error('IPFS is busy. Try again in a minute.');
+    await new Promise((res) => carQueue.push(res));
+  }
+  carActive += 1;
+  try {
+    return await fn();
+  } finally {
+    carActive -= 1;
+    carQueue.shift()?.();
+  }
+}
+
 /** Downloads a whole folder as one CAR archive (every block hash-checked). */
-async function fetchCar(cid, { timeout = 60_000, maxBytes = 64_000_000 } = {}) {
+function fetchCar(cid, opts) {
+  return carSlot(() => fetchCarNow(cid, opts));
+}
+async function fetchCarNow(cid, { timeout = 60_000, maxBytes = CAR_MAX_BYTES } = {}) {
   const { value } = await gatewayFetch(cid.toString(), {
     query: '?format=car&dag-scope=all', accept: 'application/vnd.ipld.car;version=1;order=dfs;dups=n,application/vnd.ipld.car',
-    timeout, maxBytes, width: 3, stagger: 1500,
+    timeout, maxBytes: Math.min(maxBytes, CAR_MAX_BYTES), width: 2, stagger: 2500,
     check: async (_res, buf) => {
       const blocks = new Map();
       const it = await CarBlockIterator.fromBytes(new Uint8Array(buf));

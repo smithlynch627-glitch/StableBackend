@@ -86,6 +86,14 @@ export const ACTIVITY_SELECT = `select a.id, a.type, a.collection, a.token_id::t
   join collections c on c.address = a.collection
   left join tokens t on t.collection = a.collection and t.token_id = a.token_id`;
 
+/** Earlier STABLE marketplaces on this chain (from LEGACY_MARKETS plus the known GIWA Sepolia ones). */
+const KNOWN_LEGACY = { 91342: ['0xa43c3ccd4a4b433287b30360bac8187f12a02fae', '0xe451c7b274b235e055298f857bb7adcbea8561ef'] };
+function legacyMarkets() {
+  const env = String(process.env.LEGACY_MARKETS || '').split(',').map((a) => a.trim().toLowerCase());
+  const all = [...(KNOWN_LEGACY[config.chainId] || []), ...env].filter((a) => /^0x[0-9a-f]{40}$/.test(a));
+  return [...new Set(all)].filter((a) => a !== (config.market || '').toLowerCase());
+}
+
 export async function publicConfig() {
   const fees = contractsReady() ? await chainFees() : {};
   return {
@@ -95,6 +103,8 @@ export async function publicConfig() {
     rpcUrl: config.publicRpcUrl,
     explorerUrl: config.explorerUrl,
     market: config.market || null,
+    // Previous marketplace contracts (paused). Shown on the Security page so wallets can revoke old approvals.
+    legacyMarkets: legacyMarkets(),
     factory: config.factory || null,
     feeVault: config.feeVault || null,
     weth: config.weth,

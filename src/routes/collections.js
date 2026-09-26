@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { many, one } from '../db.js';
-import { ah, clampInt } from '../lib/http.js';
+import { ah, clampInt, microCache } from '../lib/http.js';
 import { BEST_LISTING_JOIN, COLLECTION_COLS, NO_TRAIT, TOKEN_COLS, loadCollection, loadDrop, traitCounts } from '../lib/queries.js';
 import { maybeRepair } from '../indexer/core.js';
 
@@ -150,7 +150,7 @@ const ZERO = '0x0000000000000000000000000000000000000000';
  * Holders with their holdings, sample images, and trading history in this collection.
  * PnL = received from sales + items held x floor - spent on mints and purchases (floor 0 if nothing is listed).
  */
-r.get('/:key/holders', ah(async (req, res) => {
+r.get('/:key/holders', microCache(15_000), ah(async (req, res) => {
   const col = await loadCollection(req.params.key);
   const limit = clampInt(req.query.limit, 1, 100, 50);
   const offset = clampInt(req.query.offset, 0, 1_000_000, 0);
@@ -235,7 +235,7 @@ const RANGES = {
 };
 
 /** Volume, sales, price history, floor history, top sales and the rarest listed items. */
-r.get('/:key/analytics', ah(async (req, res) => {
+r.get('/:key/analytics', microCache(30_000), ah(async (req, res) => {
   const col = await loadCollection(req.params.key);
   const range = RANGES[req.query.range] ? String(req.query.range) : '7d';
   const R = RANGES[range];

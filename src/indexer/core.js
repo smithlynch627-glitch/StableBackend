@@ -1,12 +1,12 @@
 // Turns GIWA logs into marketplace state. Used by the indexer loop and by POST /api/orders/sync,
 // so a user's own transaction shows up immediately.
 import { Interface } from 'ethers';
-import { parseIpfs, probeIpfs, readIpfsJson } from '../lib/ipfs.js';
+import { parseIpfs, probeIpfs, readCapped, readIpfsJson } from '../lib/ipfs.js';
 import { config, ZERO_ADDRESS } from '../config.js';
 import { many, one, q } from '../db.js';
 import { COLLECTION_ABI, FACTORY_ABI, MARKET_ABI, collectionContract, getProvider, market as marketContract } from '../lib/chain.js';
 import { refreshCollectionStats } from '../lib/stats.js';
-import { assertPublicUrl, safeGet } from '../lib/safeFetch.js';
+import { safeGet, safeProbe } from '../lib/safeFetch.js';
 
 const colIface = new Interface(COLLECTION_ABI);
 const marketIface = new Interface(MARKET_ABI);
@@ -285,6 +285,7 @@ export async function applyCollectionFlags() {
 
 export async function processLogs(logs) {
   const known = await knownCollections();
+  const externals = new Set((await many(`select address from collections where is_external`)).map((r) => r.address));
   const touched = new Set();
   const byTx = new Map();
   for (const log of logs) {
@@ -314,6 +315,8 @@ export async function processLogs(logs) {
       const address = lc(log.address);
       if (!known.has(address)) continue;
       const topic = log.topics[0];
+      // Imported (non-launchpad) contracts can emit look-alike events: only standard ERC-721 / ERC-4906 ones count.
+      if (externals.has(address) && topic !== TOPIC.approvalForAll && topic !== TOPIC.batchMeta) continue;
       if (topic === TOPIC.minted) {
         const ev = parse(colIface, log);
         const qty = Number(ev.args.quantity);
@@ -579,31 +582,23 @@ async function probeOnce(uri, timeout) {
   if (!uri || typeof uri !== 'string') return { ok: false, error: 'no image' };
   if (uri.startsWith('data:image/')) return { ok: true };
   if (uri.startsWith('ipfs://')) return probeIpfs(uri, { timeout: Math.max(timeout, 10_000) });
-  const trusted = uri.startsWith('ipfs://') || uri.startsWith('ar://');
-  const urls = uri.startsWith('ipfs://') ? GATEWAYS.map((g) => ipfsToHttp(uri, g)) : [ipfsToHttp(uri)];
-  let last = 'not reachable';
-  for (let url of urls) {
-    try {
-      // User-supplied web links are checked against private/internal addresses first (SSRF protection).
-      const get = async (u) => {
-        if (!trusted) await assertPublicUrl(u);
-        return fetch(u, { signal: AbortSignal.timeout(timeout), redirect: trusted ? 'follow' : 'manual', headers: { range: 'bytes=0-2047' } });
-      };
-      let res = await get(url);
-      if (!trusted && res.status >= 300 && res.status < 400 && res.headers.get('location')) {
-        url = new URL(res.headers.get('location'), url).toString();
-        res = await get(url);
-      }
-      const type = res.headers.get('content-type') || '';
-      await res.body?.cancel().catch(() => {});
-      if (!res.ok) { last = `HTTP ${res.status}`; continue; }
-      if (/^text\/html/i.test(type)) { last = 'the link opens a folder or web page, not an image'; continue; }
-      return { ok: true, url };
-    } catch (e) {
-      last = e.name === 'TimeoutError' ? 'timed out' : e.message;
+  const url = ipfsToHttp(uri);
+  try {
+    let res;
+    if (url.startsWith('https://arweave.net/')) {
+      const r = await fetch(url, { signal: AbortSignal.timeout(timeout), headers: { range: 'bytes=0-2047' } });
+      await r.body?.cancel().catch(() => {});
+      res = { ok: r.ok, status: r.status, type: r.headers.get('content-type') || '', url };
+    } else {
+      // A creator-supplied web link: public https hosts only, checked at connect time (SSRF protection).
+      res = await safeProbe(url, { timeout });
     }
+    if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+    if (/^text\/html/i.test(res.type)) return { ok: false, error: 'the link opens a folder or web page, not an image' };
+    return { ok: true, url: res.url };
+  } catch (e) {
+    return { ok: false, error: e.name === 'TimeoutError' || /timed out/.test(e.message) ? 'timed out' : e.message };
   }
-  return { ok: false, error: last };
 }
 
 /** Fetches JSON from ipfs:// (all gateways), ar:// or https://, with a timeout and a size cap. */
@@ -624,8 +619,7 @@ export async function fetchJsonUri(uri, { timeout = 12_000, maxBytes = 1_000_000
       }
       const res = await fetch(url, { signal: AbortSignal.timeout(timeout), headers: { accept: 'application/json' } });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const buf = Buffer.from(await res.arrayBuffer());
-      if (buf.length > maxBytes) throw new Error('metadata file too large');
+      const buf = await readCapped(res, maxBytes);
       return JSON.parse(buf.toString('utf8'));
     } catch (e) {
       last = e;

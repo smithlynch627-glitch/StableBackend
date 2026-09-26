@@ -12,13 +12,14 @@ r.get('/health', ah(async (_req, res) => {
   await one('select 1');
   const st = networkStatus();
   // 503 until the active network (and its chain_<id> tables) is loaded, with the reason.
-  res.status(st.chain ? 200 : 503).json({ ok: Boolean(st.chain), ...st, time: new Date().toISOString() });
+  // Public: only whether it works. Details (error text) go to the server log and the admin panel.
+  res.status(st.chain ? 200 : 503).json({ ok: Boolean(st.chain), chain: st.chain, network: st.network, degraded: Boolean(st.error || st.schemaWarning), time: new Date().toISOString() });
 }));
 
 r.get('/config', ah(async (_req, res) => res.json(await publicConfig())));
 
-r.post('/auth/nonce', ah(async (req, res) => res.json(await createNonce(req.body?.address))));
-r.post('/auth/verify', ah(async (req, res) => res.json(await verifySignIn(req.body || {}))));
+r.post('/auth/nonce', ah(async (req, res) => res.json(await createNonce(req.body?.address, req.headers.origin))));
+r.post('/auth/verify', ah(async (req, res) => res.json(await verifySignIn(req.body || {}, req.headers.origin))));
 r.get('/auth/me', requireAuth, ah(async (req, res) => res.json({ address: req.user, role: await roleOf(req.user) })));
 
 r.get('/search', ah(async (req, res) => {

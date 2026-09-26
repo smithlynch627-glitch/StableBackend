@@ -97,7 +97,7 @@ r.post('/', requireAuth, ah(async (req, res) => {
   const params = [address];
   for (const [k, col] of Object.entries(fields)) {
     if (!(k in b)) continue;
-    params.push(k === 'description' ? String(b.description || '').slice(0, 2000) : safeUrl(b[k]));
+    params.push(k === 'description' ? String(b.description || '').slice(0, 2000) : k === 'imageUrl' || k === 'bannerUrl' ? safeImage(b[k]) : safeLink(b[k]));
     sets.push(`${col} = $${params.length}`);
   }
   if (sets.length) await q(`update collections set ${sets.join(', ')} where address = $1`, params);
@@ -121,11 +121,25 @@ r.post('/', requireAuth, ah(async (req, res) => {
   res.json({ collection: await loadCollection(address) });
 }));
 
-function safeUrl(v) {
+/** Social / website links: https only (no javascript:, data: or plain http links on the collection page). */
+function safeLink(v) {
+  if (!v) return null;
+  let s = String(v).trim();
+  if (!s) return null;
+  if (/^http:\/\//i.test(s)) s = `https://${s.slice(7)}`; // upgrade plain http
+  else if (/^(www\.)?[a-z0-9-]+(\.[a-z0-9-]+)+(\/\S*)?$/i.test(s)) s = `https://${s}`; // "x.com/name" → https://x.com/name
+  if (s.length > 300 || !/^https:\/\/[^\s"'<>\\]+$/i.test(s)) throw bad('Links must start with https://');
+  try { new URL(s); } catch { throw bad('That link is not valid'); }
+  return s;
+}
+
+/** Logo / banner: https, ipfs:// or an embedded PNG/JPG/GIF/WebP/AVIF image. */
+function safeImage(v) {
   if (!v) return null;
   const s = String(v).trim();
-  if (s.startsWith('data:image/') && s.length < 1_300_000) return s;
-  return /^(https?:\/\/|ipfs:\/\/)/i.test(s) ? s.slice(0, 500) : null;
+  if (/^data:image\/(png|jpeg|gif|webp|avif);base64,[a-z0-9+/=]+$/i.test(s) && s.length < 1_300_000) return s;
+  if (/^(https:\/\/|ipfs:\/\/)[^\s"'<>\\]+$/i.test(s) && s.length <= 500) return s;
+  throw bad('Images must be an https:// or ipfs:// link');
 }
 
 export default r;

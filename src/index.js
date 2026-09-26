@@ -23,7 +23,8 @@ import { loadNetwork, watchNetwork } from './lib/network.js';
 
 const app = express();
 const blockedOrigins = new Set();
-app.set('trust proxy', 1);
+// Railway puts one proxy in front of the API. Behind Cloudflare too, set TRUST_PROXY=2 so rate limits see the real visitor.
+app.set('trust proxy', Math.max(0, Math.min(5, Number(process.env.TRUST_PROXY ?? 1))));
 app.use(
   helmet({
     crossOriginResourcePolicy: { policy: 'cross-origin' },
@@ -37,7 +38,7 @@ app.use(
   cors({
     origin: (origin, cb) => {
       const ok = !origin || config.corsOrigins.includes(origin) || config.adminOrigins.includes(origin);
-      if (!ok && !blockedOrigins.has(origin)) {
+      if (!ok && !blockedOrigins.has(origin) && blockedOrigins.size < 200) {
         blockedOrigins.add(origin);
         console.warn(`[cors] blocked ${origin}. Add it to CORS_ORIGINS (website) or ADMIN_ORIGINS (admin app) in .env and restart.`);
       }

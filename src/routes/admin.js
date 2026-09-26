@@ -5,13 +5,13 @@ import { JsonRpcProvider, Contract } from 'ethers';
 import { config } from '../config.js';
 import { many, one, q, tx } from '../db.js';
 import { HttpError, ah, addrParam, bad, clampInt, notFound } from '../lib/http.js';
-import { requireAuth } from '../lib/auth.js';
+import { forgetBan, requireAdminSession } from '../lib/auth.js';
 import { audit, requireRole } from '../lib/admin.js';
 import { decrypt } from '../lib/crypto.js';
 import { COLLECTION_COLS } from '../lib/queries.js';
 import { discover, importCollection } from '../lib/explorer.js';
 import { SETTING_KEYS, getSettings, setSettings } from '../lib/settings.js';
-import { loadNetwork, listNetworks } from '../lib/network.js';
+import { NETWORK_LOCKED, loadNetwork, listNetworks, networkStatus } from '../lib/network.js';
 import { chainFees, collectionContract, factory as factoryContract, getProvider, market as marketContract } from '../lib/chain.js';
 import { applyCollectionFlags, queueMetadata, repairCollection, syncCollectionFromChain } from '../indexer/core.js';
 
@@ -23,7 +23,7 @@ r.use((req, _res, next) => {
   next();
 });
 r.use(rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false }));
-r.use(requireAuth);
+r.use(requireAdminSession);
 
 const ADDR = /^0x[0-9a-f]{40}$/;
 const optAddr = (v, name) => {
@@ -32,13 +32,16 @@ const optAddr = (v, name) => {
   if (!ADDR.test(a)) throw bad(`Invalid ${name}`);
   return a;
 };
-const url = (v, name, required = false) => {
+// Links shown to visitors must be https. (RPC fields may be http://localhost for local testing.)
+const url = (v, name, required = false, allowHttp = false) => {
   if (!v) {
     if (required) throw bad(`${name} is required`);
     return null;
   }
   const s = String(v).trim();
-  if (!/^https?:\/\/[^\s]+$/i.test(s) || s.length > 300) throw bad(`Invalid ${name}`);
+  const re = allowHttp ? /^https?:\/\/[^\s"'<>\\]+$/i : /^https:\/\/[^\s"'<>\\]+$/i;
+  if (!re.test(s) || s.length > 300) throw bad(`Invalid ${name} (must start with https://)`);
+  try { new URL(s); } catch { throw bad(`Invalid ${name}`); }
   return s;
 };
 
@@ -60,7 +63,7 @@ r.get('/overview', requireRole('support'), ah(async (_req, res) => {
        (select count(*) from app.users)::int as users`),
     one(`select count(*) filter (where status = 'open')::int as open, count(*) filter (where status = 'waiting')::int as waiting from app.support_tickets`),
   ]);
-  res.json({ stats, tickets, network: { key: config.networkKey, name: config.networkName, chainId: config.chainId, isTestnet: config.isTestnet } });
+  res.json({ stats, tickets, network: { key: config.networkKey, name: config.networkName, chainId: config.chainId, isTestnet: config.isTestnet, locked: NETWORK_LOCKED, status: networkStatus() } });
 }));
 
 // ── Collections ───────────────────────────────────────────────────────────────
@@ -203,9 +206,9 @@ const NETWORK_FIELDS = ['name', 'rpc_url', 'public_rpc_url', 'explorer_url', 'ex
 function cleanNetwork(b, partial = false) {
   const n = {};
   if (!partial || 'name' in b) { if (!b.name?.trim()) throw bad('Name is required'); n.name = String(b.name).trim().slice(0, 60); }
-  if (!partial || 'rpc_url' in b) n.rpc_url = url(b.rpc_url, 'RPC URL', true);
+  if (!partial || 'rpc_url' in b) n.rpc_url = url(b.rpc_url, 'RPC URL', true, true);
   if ('public_rpc_url' in b) {
-    n.public_rpc_url = url(b.public_rpc_url, 'public RPC URL');
+    n.public_rpc_url = url(b.public_rpc_url, 'public RPC URL', false, true);
     const local = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//.test(`${n.public_rpc_url}/`);
     if (n.public_rpc_url && !n.public_rpc_url.startsWith('https://') && !local) throw bad('Public RPC must use https');
   }
@@ -239,9 +242,15 @@ async function checkNetwork(n, chainId) {
   return checks;
 }
 
-r.get('/networks', requireRole('owner'), ah(async (_req, res) => res.json({ networks: await listNetworks() })));
+r.get('/networks', requireRole('owner'), ah(async (_req, res) => res.json({ networks: await listNetworks(), locked: NETWORK_LOCKED })));
 
-r.post('/networks', requireRole('owner'), ah(async (req, res) => {
+// Contract addresses and RPCs decide which contracts users' wallets are asked to approve. They are locked to the
+// server's environment variables, so even a stolen admin session can't point the marketplace at other contracts.
+const networkLock = (_req, _res, next) => next(NETWORK_LOCKED
+  ? new HttpError(403, 'Network settings are locked. Change MARKET_ADDRESS / RPC_URL etc. in the server variables (Railway), or set ALLOW_NETWORK_EDITS=1 there for a moment to edit them here.', 'network_locked')
+  : undefined);
+
+r.post('/networks', requireRole('owner'), networkLock, ah(async (req, res) => {
   const b = req.body || {};
   const key = String(b.key || '').trim();
   if (!/^[a-z0-9-]{3,40}$/.test(key)) throw bad('Key must be 3-40 lowercase letters, numbers or dashes');
@@ -260,7 +269,7 @@ r.post('/networks', requireRole('owner'), ah(async (req, res) => {
   res.json({ network: await one(`select * from app.networks where key = $1`, [key]), checks });
 }));
 
-r.put('/networks/:key', requireRole('owner'), ah(async (req, res) => {
+r.put('/networks/:key', requireRole('owner'), networkLock, ah(async (req, res) => {
   const cur = await one(`select * from app.networks where key = $1`, [req.params.key]);
   if (!cur) throw notFound('Network not found');
   const n = cleanNetwork(req.body || {}, true);
@@ -287,7 +296,7 @@ r.post('/networks/:key/test', requireRole('owner'), ah(async (req, res) => {
   res.json({ checks: await checkNetwork(cur, cur.chain_id) });
 }));
 
-r.post('/networks/:key/activate', requireRole('owner'), ah(async (req, res) => {
+r.post('/networks/:key/activate', requireRole('owner'), networkLock, ah(async (req, res) => {
   const target = await one(`select * from app.networks where key = $1`, [req.params.key]);
   if (!target) throw notFound('Network not found');
   if (req.body?.confirm !== target.key) throw bad(`Type the network key "${target.key}" to confirm`);
@@ -334,6 +343,7 @@ r.post('/users/:address/ban', requireRole('admin'), ah(async (req, res) => {
   const banned = Boolean(req.body?.banned);
   await q(`insert into app.users (address, is_banned) values ($1,$2) on conflict (address) do update set is_banned = excluded.is_banned`, [address, banned]);
   if (banned) await q(`update orders set status = 'inactive', updated_at = now() where maker = $1 and status = 'active'`, [address]);
+  forgetBan(address);
   await audit(req, banned ? 'user.ban' : 'user.unban', address);
   res.json({ ok: true });
 }));

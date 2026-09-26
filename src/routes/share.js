@@ -6,7 +6,7 @@ import { formatEther } from 'ethers';
 import { config } from '../config.js';
 import { ah, bad, notFound } from '../lib/http.js';
 import { loadCollection } from '../lib/queries.js';
-import { safeGet } from '../lib/safeFetch.js';
+import { assertSafeImage, safeGet } from '../lib/safeFetch.js';
 import { fetchJsonUri, hasRawCidPath, ipfsToHttp, metadataMedia, probeImage } from '../indexer/core.js';
 import { parseIpfs } from '../lib/ipfs.js';
 import { inspectBase, validateBase } from '../lib/metaCheck.js';
@@ -129,7 +129,9 @@ async function imageDataUri(url) {
     const { buf } = await safeGet(ipfsToHttp(url), { maxBytes: 4_000_000, timeout: 6000 });
     const sig = buf.subarray(0, 4).toString('hex');
     const mime = sig.startsWith('89504e47') ? 'image/png' : sig.startsWith('ffd8ff') ? 'image/jpeg' : sig.startsWith('47494638') ? 'image/gif' : null;
-    return mime ? `data:${mime};base64,${buf.toString('base64')}` : null; // (WebP/SVG are skipped)
+    if (!mime) return null; // (WebP/SVG are skipped)
+    assertSafeImage(buf, 16_000_000); // a tiny file claiming a gigantic size would exhaust the server's memory
+    return `data:${mime};base64,${buf.toString('base64')}`;
   } catch {
     return null;
   }

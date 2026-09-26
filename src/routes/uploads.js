@@ -5,6 +5,7 @@ import rateLimit from 'express-rate-limit';
 import { createHash } from 'node:crypto';
 import { config } from '../config.js';
 import { one } from '../db.js';
+import { imageSize } from '../lib/safeFetch.js';
 import { ah, bad, notFound } from '../lib/http.js';
 import { requireAuth } from '../lib/auth.js';
 import { audit } from '../lib/admin.js';
@@ -13,6 +14,8 @@ const r = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024, files: 1 } });
 const perWallet = (limit, windowMs) =>
   rateLimit({ windowMs, limit, keyGenerator: (req) => req.user || req.ip, standardHeaders: 'draft-7', legacyHeaders: false });
+const IPFS_KEYS_PER_WALLET = Number(process.env.IPFS_KEYS_PER_WALLET || 10);
+const IPFS_KEYS_PER_DAY = Number(process.env.IPFS_KEYS_PER_DAY || 300);
 const IMAGE = /^image\/(png|jpe?g|gif|webp|avif|svg\+xml|bmp)$/;
 
 // Magic-byte check so a renamed file cannot pretend to be an image.
@@ -62,11 +65,24 @@ async function storeMedia(owner, buffer, mime) {
   return `${config.apiPublicUrl}/api/media/${row.id}`;
 }
 
+// SVG is a document format: refuse anything that could run code or load other content when opened directly
+// (for example from an IPFS gateway link), not only when shown as an <img>.
+function svgIsSafe(buf) {
+  const t = buf.toString('utf8').toLowerCase();
+  if (/<script|<foreignobject|<iframe|<embed|<object|<!entity|javascript:|vbscript:|data:text\/html|@import|url\(\s*["']?\s*(https?:|\/\/)|\bon[a-z]+\s*=/.test(t)) return false;
+  // Links may only point inside the file (#id) or to embedded data: images.
+  const refs = t.match(/(?:xlink:)?href\s*=\s*["']([^"']*)["']/g) || [];
+  return refs.every((r) => /=\s*["'](#|data:image\/(png|jpe?g|gif|webp);)/.test(r));
+}
+
 function readImage(req) {
   const f = req.file;
   if (!f) throw bad('Choose an image to upload');
   const mime = sniff(f.buffer);
   if (!mime || !IMAGE.test(mime)) throw bad('Upload a PNG, JPG, GIF, WebP, AVIF, SVG or BMP image');
+  if (mime === 'image/svg+xml' && !svgIsSafe(f.buffer)) throw bad('This SVG contains scripts or outside links. Export it again as a plain SVG, or upload a PNG.');
+  const size = imageSize(f.buffer);
+  if (size && (size.w > 12_000 || size.h > 12_000 || size.w * size.h > 80_000_000)) throw bad(`Image is too large (${size.w}×${size.h} pixels). Keep it under 12,000 pixels per side.`);
   return { buffer: f.buffer, mime, name: (f.originalname || 'image').replace(/[^\w.-]/g, '_').slice(0, 80) };
 }
 
@@ -99,6 +115,14 @@ r.post('/prereveal', requireAuth, perWallet(30, 3600_000), upload.single('file')
 /** Single-use, upload-only Pinata key so the browser can upload a whole folder straight to IPFS. */
 r.post('/ipfs-key', requireAuth, perWallet(20, 24 * 3600_000), ah(async (req, res) => {
   if (!config.pinataJwt) throw bad('IPFS uploads are not configured on this server. Paste an existing ipfs:// URI instead.', 'no_ipfs');
+  // Quotas kept in the database (they survive restarts and can't be dodged with many wallets at once).
+  const used = await one(
+    `select count(*) filter (where actor = $1)::int as mine, count(*)::int as total
+     from app.audit_log where action = 'ipfs.key' and created_at > now() - interval '24 hours'`,
+    [req.user],
+  );
+  if (used.mine >= IPFS_KEYS_PER_WALLET) throw bad('Daily IPFS upload limit reached for this wallet. Try again tomorrow.', 'ipfs_quota');
+  if (used.total >= IPFS_KEYS_PER_DAY) throw bad('IPFS uploads are busy today. Try again later or paste an existing ipfs:// link.', 'ipfs_quota');
   const resp = await fetch('https://api.pinata.cloud/users/generateApiKey', {
     method: 'POST',
     headers: { Authorization: `Bearer ${config.pinataJwt}`, 'content-type': 'application/json' },

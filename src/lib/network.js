@@ -4,6 +4,9 @@ import { config } from '../config.js';
 import { currentChainSchema, many, one, tx, useChain } from '../db.js';
 import { resetChainClients } from './chain.js';
 
+/** Network settings (contracts, RPC) can only be changed from the admin panel when ALLOW_NETWORK_EDITS=1. */
+export const NETWORK_LOCKED = process.env.ALLOW_NETWORK_EDITS !== '1';
+
 // Snapshot of the network settings from .env, taken before any database values are applied.
 const ENV = {
   chainId: config.chainId,
@@ -96,8 +99,8 @@ async function loadNetworkInner() {
       [config.chainId, config.rpcUrl, config.publicRpcUrl, config.explorerUrl, config.explorerApiUrl, config.market, config.factory,
         config.feeVault, config.weth, config.officialCollection, config.indexerStartBlock],
     );
-  } else if ((!n.updated_by || n.updated_by === 'env') && n.chain_id === ENV.chainId && ENV.hasEnv) {
-    // .env stays in control of this network until someone edits it in Admin → Network.
+  } else if ((NETWORK_LOCKED || !n.updated_by || n.updated_by === 'env') && n.chain_id === ENV.chainId && ENV.hasEnv) {
+    // .env is in control of this network (always, while network edits are locked).
     const changed = Object.entries(ENV.row).filter(([k, v]) => String(n[k] ?? '') !== String(v ?? ''));
     if (changed.length) {
       n = await one(

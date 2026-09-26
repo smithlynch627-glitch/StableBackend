@@ -42,3 +42,25 @@ export const clampInt = (v, min, max, d) => {
 
 export const randomHash = () =>
   '0x' + [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, '0')).join('');
+
+/**
+ * Tiny response cache for expensive public GETs (holders, analytics): the same URL within `ttl` ms is answered
+ * from memory, so repeated or scripted requests can't pile heavy queries onto the database.
+ */
+export function microCache(ttl = 15_000, max = 500) {
+  const store = new Map();
+  return (req, res, next) => {
+    const k = req.originalUrl;
+    const hit = store.get(k);
+    if (hit && Date.now() - hit.at < ttl) return res.json(hit.body);
+    const json = res.json.bind(res);
+    res.json = (body) => {
+      if (res.statusCode === 200) {
+        if (store.size >= max) store.delete(store.keys().next().value);
+        store.set(k, { at: Date.now(), body });
+      }
+      return json(body);
+    };
+    next();
+  };
+}

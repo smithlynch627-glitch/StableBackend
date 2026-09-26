@@ -65,6 +65,9 @@ if (!config.jwtSecret || config.jwtSecret.length < 32) {
   console.log(`[config] root admin wallets from ADMIN_ADDRESSES: ${shown || 'none set'}`);
   console.log(`[config] website origins: ${config.corsOrigins.join(', ')} | admin origins: ${config.adminOrigins.join(', ')}`);
 }
+if (config.env === 'production' && !config.databaseCa && !/localhost|127\.0\.0\.1/.test(config.databaseUrl)) {
+  console.warn('[config] DATABASE_CA_CERT is not set: the database connection is encrypted but the server certificate is not verified. Paste the Supabase CA certificate into DATABASE_CA_CERT.');
+}
 if (!config.encryptionKey) console.warn('[config] DATA_ENCRYPTION_KEY is not set. Support contact details will not be stored.');
 
 export const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';

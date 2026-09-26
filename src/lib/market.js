@@ -1,5 +1,5 @@
 // StableMarket orders: EIP-712 hashing and validation against the contract itself.
-import { TypedDataEncoder, isAddress } from 'ethers';
+import { TypedDataEncoder, isAddress, verifyTypedData } from 'ethers';
 import { config } from '../config.js';
 import { bad } from './http.js';
 import { market } from './chain.js';
@@ -85,3 +85,27 @@ export async function validateOrder(raw, signature) {
 }
 
 export const toTuple = (o) => [o.maker, o.side, o.collection, o.tokenId, o.anyToken, o.price, o.maxFeeBps, o.maxRoyaltyBps, o.expiry, o.salt, o.counter];
+
+/** EIP-712 struct hash of one order (what a bulk signature lists), same as the contract's orderStructHash. */
+export const orderStructHash = (o) => TypedDataEncoder.hashStruct('Order', ORDER_TYPES, o).toLowerCase();
+
+export const BULK_TYPES = { BulkOrder: [{ name: 'orders', type: 'Order[]' }], Order: ORDER_TYPES.Order };
+export const BULK_MAGIC = '5354424b';
+
+/**
+ * One signature for many listings: checks it really is the makers' signature over exactly these orders (the
+ * wallet showed every one of them), then returns the per-order signature the contract expects.
+ */
+export function bulkSignatures(orders, signature) {
+  if (!Array.isArray(orders) || orders.length < 1 || orders.length > 50) throw bad('Send 1 to 50 orders');
+  if (typeof signature !== 'string' || !/^0x[0-9a-fA-F]{130}$/.test(signature)) throw bad('Missing signature');
+  const norm = orders.map(normalizeOrder);
+  const maker = norm[0].maker;
+  if (norm.some((o) => o.maker !== maker)) throw bad('All orders in one signature must be from the same wallet');
+  const signer = verifyTypedData(domain(), BULK_TYPES, { orders: norm }, signature).toLowerCase();
+  if (signer !== maker) throw bad('The signature is not from this wallet');
+  const hashes = norm.map(orderStructHash);
+  const packed = hashes.map((h) => h.slice(2)).join('');
+  const n = norm.length.toString(16).padStart(4, '0');
+  return norm.map((o, i) => ({ order: o, signature: `0x${BULK_MAGIC}${i.toString(16).padStart(4, '0')}${n}${packed}${signature.slice(2)}` }));
+}
