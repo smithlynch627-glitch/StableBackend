@@ -189,12 +189,27 @@ create table if not exists app.treasury_cursor (
   primary key (chain_id, scope)
 );
 
+-- Creators' connected X accounts (05_x_connect.sql for existing databases).
+alter table app.users add column if not exists x_user_id text;
+alter table app.users add column if not exists x_username text check (x_username is null or x_username ~ '^[A-Za-z0-9_]{1,15}$');
+alter table app.users add column if not exists x_connected_at timestamptz;
+
+-- Pending "Connect X" attempts (10 minutes, used once).
+create table if not exists app.x_oauth (
+  state      text primary key check (char_length(state) between 20 and 100),
+  address    text not null check (address ~ '^0x[0-9a-f]{40}$'),
+  verifier   text not null,
+  return_to  text not null,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null
+);
+
 -- Lock every app table: RLS on, only stable_api allowed.
 do $$
 declare t text;
 begin
   foreach t in array array['networks','admins','users','auth_nonces','support_tickets','ticket_messages','audit_log','media','settings',
-                        'safe_proposals','safe_signatures','treasury_events','treasury_cursor'] loop
+                        'safe_proposals','safe_signatures','treasury_events','treasury_cursor','x_oauth'] loop
     execute format('alter table app.%I enable row level security', t);
     execute format('drop policy if exists api_all on app.%I', t);
     execute format('create policy api_all on app.%I for all to stable_api using (true) with check (true)', t);

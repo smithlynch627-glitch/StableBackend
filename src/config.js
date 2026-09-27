@@ -29,6 +29,14 @@ export const config = {
   rootAdmins: list(process.env.ADMIN_ADDRESSES).filter((a) => /^0x[0-9a-f]{40}$/.test(a)),
   encryptionKey: process.env.DATA_ENCRYPTION_KEY || '',
   pinataJwt: process.env.PINATA_JWT || '',
+  // X (Twitter) account connection for creators. OAuth 2.0 with PKCE; only @username is read, then the token is revoked.
+  x: {
+    clientId: (process.env.X_CLIENT_ID || '').trim(),
+    clientSecret: (process.env.X_CLIENT_SECRET || '').trim(),
+    redirectUri: (process.env.X_REDIRECT_URI || '').trim(),
+    authUrl: (process.env.X_AUTH_URL || 'https://x.com/i/oauth2/authorize').trim(),
+    apiBase: (process.env.X_API_BASE || 'https://api.x.com').trim().replace(/\/$/, ''),
+  },
   verifiedCollections: list(process.env.VERIFIED_COLLECTIONS),
   officialSlug: 'giwa-cows',
   indexerPollMs: Number(process.env.INDEXER_POLL_MS || 3000),

@@ -19,6 +19,7 @@ import uploads, { media } from './routes/uploads.js';
 import admin from './routes/admin.js';
 import share from './routes/share.js';
 import support from './routes/support.js';
+import xConnect from './routes/x.js';
 import { loadNetwork, watchNetwork } from './lib/network.js';
 
 const app = express();
@@ -69,6 +70,7 @@ app.use('/api/media', media);
 app.use('/api/admin', admin);
 app.use('/api/share', share);
 app.use('/api/support', support);
+app.use('/api/x', xConnect);
 
 app.use((_req, res) => res.status(404).json({ error: 'Route not found', code: 'not_found' }));
 
@@ -90,6 +92,9 @@ app.use((err, _req, res, _next) => {
 function describeDbError(err) {
   const code = err?.code;
   const msg = String(err?.message || '');
+  if (code === '42P01' && /safe_proposals|safe_signatures|treasury_events|treasury_cursor/.test(msg)) {
+    return 'The admin v2 tables are missing. Run backend/db/04_admin_v2.sql once in Supabase → SQL Editor, then reload the admin page.';
+  }
   if (code === '42P01') return 'Database tables are missing. Run db/01_schema.sql (npm run db:init)';
   if (code === 'ECONNRESET' || /Connection terminated unexpectedly/i.test(msg))
     return 'The database pooler closed the connection. Copy the host exactly from Supabase → Connect → Direct → Session pooler, use user stable_api.<project-ref> and port 5432';
@@ -111,6 +116,8 @@ async function checkDatabase() {
       console.error(`[db] Connected to ${host}, but tables are missing. Run db/01_schema.sql (npm run db:init)`);
       return;
     }
+    const v2 = await getPool().query(`select to_regclass('app.safe_proposals') as t`);
+    if (!v2.rows[0].t) console.warn('[db] Admin v2 tables are missing: run backend/db/04_admin_v2.sql in the Supabase SQL editor (Treasury and Multisig need them).');
     console.log(`[db] Connected to ${host} over ${/localhost|127\.0\.0\.1/.test(config.databaseUrl) ? 'a local socket' : config.databaseCa ? 'verified TLS' : 'TLS'}.`);
   } catch (e) {
     console.error(`[db] ${describeDbError(e) || e.message} (host: ${host})`);

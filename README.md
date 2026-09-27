@@ -12,6 +12,7 @@ their transaction is confirmed on GIWA.
    - `db/02_api_role.sql`: gives `stable_api` a password (change it first)
    - `db/03_first_admin.sql`: optional, adds panel admins (or use `ADMIN_ADDRESSES`)
    - `db/04_admin_v2.sql`: multisig proposals and treasury history for the admin panel (existing databases: run it once)
+   - `db/05_x_connect.sql`: creators' connected X accounts (existing databases: run it once)
    - `db/99_cleanup_v1.sql`: optional, removes the old test-mode tables
 3. Fill `backend/.env` from `.env.example`. `DATABASE_URL` uses the `stable_api` user. Network values in `.env`
    stay in control until someone edits the network in the admin panel; after that the panel is the source of truth.

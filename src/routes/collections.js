@@ -18,8 +18,10 @@ r.get('/', ah(async (req, res) => {
   const sort = SORTS[req.query.sort] || SORTS.volume_24h;
   const limit = clampInt(req.query.limit, 1, 100, 24);
   const offset = clampInt(req.query.offset, 0, 100000, 0);
+  // ?featured=1: collections an admin marked as featured (the official collection has its own spot on the home page).
+  const featured = req.query.featured === '1' ? ' and c.featured and not c.is_official' : '';
   const rows = await many(
-    `select ${COLLECTION_COLS} from collections c where not c.hidden order by c.is_official desc, c.featured desc, ${sort} limit $1 offset $2`,
+    `select ${COLLECTION_COLS} from collections c where not c.hidden${featured} order by c.is_official desc, c.featured desc, ${sort} limit $1 offset $2`,
     [limit, offset],
   );
   res.json({ collections: rows });

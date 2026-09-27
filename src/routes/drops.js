@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { connectedXLink, xReady } from './x.js';
 import { StandardMerkleTree } from '@openzeppelin/merkle-tree';
 import { config } from '../config.js';
 import { many, one, q } from '../db.js';
@@ -91,6 +92,11 @@ r.post('/', requireAuth, ah(async (req, res) => {
   if (owner !== req.user) throw forbidden('Only the collection owner can edit this drop');
 
   await syncCollectionFromChain(address, owner, undefined, await phaseTxContext(address, b.txHash));
+  // The X link is never typed: it is the owner's connected X account (Create / Studio → Connect X).
+  if ('twitter' in b && xReady()) {
+    b.twitter = await connectedXLink(req.user);
+    if (!b.twitter) throw bad('Connect your X account first (Create → Details → Connect X).');
+  }
   // Only the fields that were sent are changed (the Studio sends partial updates).
   const fields = { description: 'description', imageUrl: 'image_url', bannerUrl: 'banner_url', twitter: 'twitter', website: 'website', discord: 'discord', telegram: 'telegram' };
   const sets = [];
