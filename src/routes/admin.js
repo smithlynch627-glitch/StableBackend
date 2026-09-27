@@ -14,6 +14,8 @@ import { SETTING_KEYS, getSettings, setSettings } from '../lib/settings.js';
 import { NETWORK_LOCKED, loadNetwork, listNetworks, networkStatus } from '../lib/network.js';
 import { chainFees, collectionContract, factory as factoryContract, getProvider, market as marketContract } from '../lib/chain.js';
 import { applyCollectionFlags, queueMetadata, repairCollection, syncCollectionFromChain } from '../indexer/core.js';
+import { guardianOf, marketFactories } from '../lib/safe.js';
+import { treasuryRoutes } from './adminTreasury.js';
 
 const r = Router();
 // Defense in depth: the admin API only answers the separate admin site, never the public marketplace origin.
@@ -24,6 +26,7 @@ r.use((req, _res, next) => {
 });
 r.use(rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false }));
 r.use(requireAdminSession);
+treasuryRoutes(r);
 
 const ADDR = /^0x[0-9a-f]{40}$/;
 const optAddr = (v, name) => {
@@ -63,7 +66,14 @@ r.get('/overview', requireRole('support'), ah(async (_req, res) => {
        (select count(*) from app.users)::int as users`),
     one(`select count(*) filter (where status = 'open')::int as open, count(*) filter (where status = 'waiting')::int as waiting from app.support_tickets`),
   ]);
-  res.json({ stats, tickets, network: { key: config.networkKey, name: config.networkName, chainId: config.chainId, isTestnet: config.isTestnet, locked: NETWORK_LOCKED, status: networkStatus() } });
+  const [daily, pending] = await Promise.all([
+    many(`with days as (select generate_series(date_trunc('day', now()) - interval '29 days', date_trunc('day', now()), interval '1 day') as d),
+               a as (select date_trunc('day', created_at) as d, sum(price_wei) as vol, count(*)::int as n from activity
+                     where type = 'sale' and created_at >= date_trunc('day', now()) - interval '29 days' group by 1)
+          select to_char(days.d, 'YYYY-MM-DD') as day, coalesce(a.vol, 0)::text as value, coalesce(a.n, 0) as sales from days left join a on a.d = days.d order by days.d`),
+    one(`select count(*)::int as n from app.safe_proposals where chain_id = $1 and status = 'pending'`, [config.chainId]).catch(() => ({ n: 0 })),
+  ]);
+  res.json({ stats, tickets, daily, proposals: { pending: pending?.n || 0 }, network: { key: config.networkKey, name: config.networkName, chainId: config.chainId, isTestnet: config.isTestnet, locked: NETWORK_LOCKED, status: networkStatus() } });
 }));
 
 // ── Collections ───────────────────────────────────────────────────────────────
@@ -192,7 +202,17 @@ r.get('/chain', requireRole('admin'), ah(async (_req, res) => {
     getProvider().getBalance(config.feeVault), erc20.balanceOf(config.feeVault), getProvider().getBlockNumber(),
   ]);
   const vaultOwner = await new Contract(config.feeVault, ['function owner() view returns (address)'], getProvider()).owner();
+  const OWN = ['function owner() view returns (address)', 'function paused() view returns (bool)', 'function platformFeeBps() view returns (uint16)', 'function pendingOwner() view returns (address)'];
+  const factories = await Promise.all((await marketFactories()).map(async (address) => {
+    const f = new Contract(address, OWN, getProvider());
+    const [owner, paused, feeBps, pendingOwner] = await Promise.all([f.owner().catch(() => null), f.paused().catch(() => null), f.platformFeeBps().catch(() => null), f.pendingOwner().catch(() => null)]);
+    return { address, owner, paused, feeBps: feeBps === null ? null : Number(feeBps), pendingOwner, current: address === config.factory };
+  }));
+  const [guardian, version] = await Promise.all([
+    guardianOf(), new Contract(config.market, ['function version() view returns (uint256)'], getProvider()).version().then(Number).catch(() => 1),
+  ]);
   res.json({
+    factories, guardian, marketVersion: version,
     ready: true, block, market: { address: config.market, owner: mOwner, paused: mPaused, feeBps: Number(mFee), feeRecipient: fRecipient },
     factory: { address: config.factory, owner: fOwner, paused: fPaused, feeBps: Number(fFee) },
     vault: { address: config.feeVault, owner: vaultOwner, eth: vaultEth.toString(), weth: vaultWeth.toString() }, weth: config.weth,
@@ -396,13 +416,20 @@ r.patch('/tickets/:id', requireRole('support'), ah(async (req, res) => {
 }));
 
 // ── Audit log ────────────────────────────────────────────────────────────────
+const AUDIT_CATEGORIES = ['collection', 'safe', 'settings', 'network', 'admin', 'ticket', 'user'];
 r.get('/audit', requireRole('admin'), ah(async (req, res) => {
   const before = clampInt(req.query.before, 0, Number.MAX_SAFE_INTEGER, 0);
+  const limit = clampInt(req.query.limit, 1, 200, 100);
+  const category = AUDIT_CATEGORIES.includes(String(req.query.category)) ? String(req.query.category) : '';
+  const term = String(req.query.q || '').trim().toLowerCase().replace(/[%_\\]/g, '').slice(0, 80);
   const rows = await many(
-    `select id, actor, action, target, details, created_at from app.audit_log where ($1 = 0 or id < $1) order by id desc limit 100`,
-    [before],
+    `select id, actor, action, target, details, created_at from app.audit_log
+     where ($1 = 0 or id < $1) and ($2 = '' or action like $2 || '.%')
+       and ($3 = '' or actor like '%' || $3 || '%' or coalesce(target, '') like '%' || $3 || '%' or action like '%' || $3 || '%' or details::text ilike '%' || $3 || '%')
+     order by id desc limit $4`,
+    [before, category, term, limit + 1],
   );
-  res.json({ entries: rows });
+  res.json({ entries: rows.slice(0, limit), more: rows.length > limit });
 }));
 
 export default r;
