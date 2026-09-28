@@ -11,6 +11,7 @@ import { decrypt } from '../lib/crypto.js';
 import { COLLECTION_COLS } from '../lib/queries.js';
 import { discover, importCollection } from '../lib/explorer.js';
 import { SETTING_KEYS, getSettings, setSettings } from '../lib/settings.js';
+import { saveBranding, saveLegal, siteContent } from '../lib/siteContent.js';
 import { NETWORK_LOCKED, loadNetwork, listNetworks, networkStatus } from '../lib/network.js';
 import { chainFees, collectionContract, factory as factoryContract, getProvider, market as marketContract } from '../lib/chain.js';
 import { applyCollectionFlags, queueMetadata, repairCollection, syncCollectionFromChain } from '../indexer/core.js';
@@ -174,6 +175,21 @@ r.put('/settings', requireRole('admin'), ah(async (req, res) => {
   await setSettings(out, req.user);
   await audit(req, 'settings.update', null, out);
   res.json({ settings: await getSettings() });
+}));
+
+// ── Website content: logo, GIWA COWS artwork, Terms and Privacy (no redeploy needed) ───────────
+r.get('/site', requireRole('admin'), ah(async (_req, res) => res.json(await siteContent())));
+r.put('/site/branding', requireRole('admin'), ah(async (req, res) => {
+  const changed = await saveBranding(req.body || {}, req.user);
+  await audit(req, 'settings.branding', null, { ...changed, ...(changed['cows.images'] ? { 'cows.images': `${changed['cows.images'].length} images` } : {}) });
+  res.json(await siteContent());
+}));
+r.put('/site/legal/:kind/:lang', requireRole('admin'), ah(async (req, res) => {
+  const text = req.body?.text;
+  if (text !== null && text !== undefined && typeof text !== 'string') throw bad('text must be a string');
+  const details = await saveLegal(String(req.params.kind), String(req.params.lang), text ?? '', req.user);
+  await audit(req, 'settings.legal', details.page, details);
+  res.json(await siteContent());
 }));
 
 // ── Discover existing collections on the network (Blockscout) ──────────────────

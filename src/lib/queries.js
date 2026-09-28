@@ -3,6 +3,7 @@ import { isAddress } from 'ethers';
 import { config, contractsReady } from '../config.js';
 import { chainFees } from './chain.js';
 import { publicSocials } from './settings.js';
+import { publicBranding } from './siteContent.js';
 import { many, one } from '../db.js';
 import { notFound } from './http.js';
 import { dropState } from './drops.js';
@@ -117,5 +118,7 @@ export async function publicConfig() {
     // The site loads IPFS images through this gateway first (e.g. your Pinata dedicated gateway), then public ones.
     ipfsGateway: /^https:\/\/[^\s]+$/.test(process.env.IPFS_GATEWAY || '') ? process.env.IPFS_GATEWAY.replace(/\/?$/, '/') : null,
     socials: await publicSocials(),
+    // Site logo and GIWA COWS artwork set in the admin panel (null = the website's built-in defaults).
+    branding: await publicBranding(),
   };
 }

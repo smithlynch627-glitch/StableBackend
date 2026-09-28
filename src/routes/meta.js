@@ -5,6 +5,7 @@ import { COLLECTION_COLS, publicConfig } from '../lib/queries.js';
 import { createNonce, requireAuth, verifySignIn } from '../lib/auth.js';
 import { roleOf } from '../lib/admin.js';
 import { networkStatus } from '../lib/network.js';
+import { LEGAL_KINDS, legalDoc } from '../lib/siteContent.js';
 
 const r = Router();
 
@@ -17,6 +18,15 @@ r.get('/health', ah(async (_req, res) => {
 }));
 
 r.get('/config', ah(async (_req, res) => res.json(await publicConfig())));
+
+/** Terms of Use / Privacy Policy text set in the admin panel (null = the website shows its built-in text). */
+r.get('/legal/:kind', ah(async (req, res) => {
+  const kind = String(req.params.kind);
+  if (!LEGAL_KINDS.includes(kind)) return res.status(404).json({ error: 'Not found' });
+  const lang = req.query.lang === 'ko' ? 'ko' : 'en';
+  res.set('cache-control', 'public, max-age=30');
+  res.json({ doc: await legalDoc(kind, lang) });
+}));
 
 r.post('/auth/nonce', ah(async (req, res) => res.json(await createNonce(req.body?.address, req.headers.origin))));
 r.post('/auth/verify', ah(async (req, res) => res.json(await verifySignIn(req.body || {}, req.headers.origin))));
