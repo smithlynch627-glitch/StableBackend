@@ -9,6 +9,7 @@ import { COLLECTION_COLS, loadCollection, loadDrop } from '../lib/queries.js';
 import { dropState } from '../lib/drops.js';
 import { collectionContract, isLaunchpadCollection } from '../lib/chain.js';
 import { maybeRepair, phaseTxContext, syncCollectionFromChain } from '../indexer/core.js';
+import { cleanGallery, cleanMediaLink, galleryReady } from '../lib/collectionMedia.js';
 
 const r = Router();
 const publicPhases = (phases) => phases.map(({ allowlistId, merkleRoot, ...p }) => ({ ...p, hasAllowlist: Boolean(merkleRoot && !/^0x0+$/.test(merkleRoot)) }));
@@ -83,6 +84,8 @@ r.post('/allowlists', requireAuth, ah(async (req, res) => {
 /**
  * Registers display details for a launchpad collection (text, images, links, phase names, allowlists).
  * Only the on-chain owner can do this. Prices, times, limits and roots always come from the contract.
+ * Images: logo (imageUrl), banner (bannerUrl) and up to three extra images (gallery) for the mint page.
+ * About tab: story (about), its picture (aboutImageUrl) and up to 12 detail rows (aboutItems).
  */
 r.post('/', requireAuth, ah(async (req, res) => {
   const b = req.body || {};
@@ -103,8 +106,27 @@ r.post('/', requireAuth, ah(async (req, res) => {
   const params = [address];
   for (const [k, col] of Object.entries(fields)) {
     if (!(k in b)) continue;
+    if (k === 'imageUrl' && !String(b.imageUrl || '').trim()) continue; // a collection always keeps a logo
     params.push(k === 'description' ? String(b.description || '').slice(0, 2000) : k === 'imageUrl' || k === 'bannerUrl' ? safeImage(b[k]) : safeLink(b[k]));
     sets.push(`${col} = $${params.length}`);
+  }
+  const set = (col, val) => { params.push(val); sets.push(`${col} = $${params.length}`); };
+  // Extra images need db/06_gallery.sql. Without it the rest is still saved (a new collection must never lose
+  // its details over this) and the reply says the extra images were skipped.
+  const warnings = [];
+  if ('gallery' in b) {
+    const gallery = cleanGallery(b.gallery);
+    if (await galleryReady()) set('gallery', JSON.stringify(gallery));
+    else if (gallery.length) warnings.push('gallery_not_ready');
+  }
+  if ('about' in b) set('about', b.about ? String(b.about).slice(0, 8000) : null);
+  if ('aboutImageUrl' in b) set('about_image_url', cleanMediaLink(b.aboutImageUrl, 'About image'));
+  if ('aboutItems' in b) {
+    if (!Array.isArray(b.aboutItems) || b.aboutItems.length > 12) throw bad('About details: up to 12 rows');
+    const items = b.aboutItems
+      .map((x) => ({ label: String(x?.label || '').trim().slice(0, 40), value: String(x?.value || '').trim().slice(0, 300) }))
+      .filter((x) => x.label && x.value);
+    set('about_items', JSON.stringify(items));
   }
   if (sets.length) await q(`update collections set ${sets.join(', ')} where address = $1`, params);
 
@@ -124,7 +146,7 @@ r.post('/', requireAuth, ah(async (req, res) => {
   const last = phases[phases.length - 1];
   if (last && open(last)) last.name = 'Public';
   await q(`update drops set phases = $2 where collection = $1`, [address, JSON.stringify(phases)]);
-  res.json({ collection: await loadCollection(address) });
+  res.json({ collection: await loadCollection(address), ...(warnings.length ? { warnings } : {}) });
 }));
 
 /** Social / website links: https only (no javascript:, data: or plain http links on the collection page). */
@@ -139,13 +161,12 @@ function safeLink(v) {
   return s;
 }
 
-/** Logo / banner: https, ipfs:// or an embedded PNG/JPG/GIF/WebP/AVIF image. */
+/** Logo / banner: an https://, ipfs:// or ar:// link in any image format (or an image embedded by an older version). */
 function safeImage(v) {
   if (!v) return null;
   const s = String(v).trim();
-  if (/^data:image\/(png|jpeg|gif|webp|avif);base64,[a-z0-9+/=]+$/i.test(s) && s.length < 1_300_000) return s;
-  if (/^(https:\/\/|ipfs:\/\/)[^\s"'<>\\]+$/i.test(s) && s.length <= 500) return s;
-  throw bad('Images must be an https:// or ipfs:// link');
+  if (/^data:image\/(png|jpeg|gif|webp|avif|svg\+xml|bmp);base64,[a-z0-9+/=]+$/i.test(s) && s.length < 1_300_000) return s;
+  return cleanMediaLink(s, 'Image');
 }
 
 export default r;

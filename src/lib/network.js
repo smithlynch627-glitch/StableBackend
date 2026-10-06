@@ -46,6 +46,8 @@ async function ensureSchema(chainId) {
     });
     ensured.add(chainId);
     status.schemaWarning = null;
+    // Extra collection images (db/06_gallery.sql). Ignored when that script has not been run yet.
+    await one('select app.add_collection_gallery($1)', [chainId]).catch(() => {});
   } catch (e) {
     // The tables normally exist already; keep serving with them and retry later.
     lastEnsureFailure = Date.now();

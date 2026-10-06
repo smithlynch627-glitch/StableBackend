@@ -8,7 +8,8 @@ import { HttpError, ah, addrParam, bad, clampInt, notFound } from '../lib/http.j
 import { forgetBan, requireAdminSession } from '../lib/auth.js';
 import { audit, requireRole } from '../lib/admin.js';
 import { decrypt } from '../lib/crypto.js';
-import { COLLECTION_COLS } from '../lib/queries.js';
+import { COLLECTION_COLS, detailCols } from '../lib/queries.js';
+import { cleanGallery, cleanMediaLink, requireGallery } from '../lib/collectionMedia.js';
 import { discover, importCollection } from '../lib/explorer.js';
 import { SETTING_KEYS, getSettings, setSettings } from '../lib/settings.js';
 import { saveBranding, saveLegal, siteContent } from '../lib/siteContent.js';
@@ -90,7 +91,7 @@ r.get('/collections', requireRole('admin'), ah(async (req, res) => {
 }));
 
 r.get('/collections/:address', requireRole('admin'), ah(async (req, res) => {
-  const row = await one(`select ${COLLECTION_COLS}, c.about, c.about_image_url, c.about_items from collections c where c.address = $1`, [addrParam(req.params.address)]);
+  const row = await one(`select ${COLLECTION_COLS}, ${await detailCols()} from collections c where c.address = $1`, [addrParam(req.params.address)]);
   if (!row) throw notFound('Collection not found');
   res.json({ collection: row });
 }));
@@ -110,10 +111,7 @@ r.patch('/collections/:address', requireRole('admin'), ah(async (req, res) => {
   if ('website' in b) set('website', url(b.website, 'website'));
   if ('discord' in b) set('discord', url(b.discord, 'Discord link'));
   if ('about' in b) set('about', b.about ? String(b.about).slice(0, 8000) : null);
-  if ('about_image_url' in b) {
-    const v = String(b.about_image_url || '').trim();
-    set('about_image_url', /^ipfs:\/\/[^\s]{10,290}$/i.test(v) ? v : url(v, 'About image'));
-  }
+  if ('about_image_url' in b) set('about_image_url', cleanMediaLink(b.about_image_url, 'About image'));
   if ('about_items' in b) {
     if (!Array.isArray(b.about_items) || b.about_items.length > 12) throw bad('About details: up to 12 rows');
     const items = b.about_items
@@ -122,6 +120,11 @@ r.patch('/collections/:address', requireRole('admin'), ah(async (req, res) => {
     set('about_items', JSON.stringify(items));
   }
   if ('telegram' in b) set('telegram', url(b.telegram, 'Telegram link'));
+  if ('gallery' in b) {
+    const gallery = cleanGallery(b.gallery);
+    await requireGallery();
+    set('gallery', JSON.stringify(gallery));
+  }
   if (typeof b.slug === 'string') {
     if (!/^[a-z0-9-]{3,60}$/.test(b.slug)) throw bad('Slug must be 3-60 lowercase letters, numbers or dashes');
     set('slug', b.slug);
@@ -134,7 +137,7 @@ r.patch('/collections/:address', requireRole('admin'), ah(async (req, res) => {
   if (!row) throw notFound('Collection not found');
   if (typeof b.featured === 'boolean') await q(`update drops set featured = $2 where collection = $1`, [address, b.featured]);
   await audit(req, 'collection.update', address, b);
-  res.json({ collection: await one(`select ${COLLECTION_COLS}, c.about, c.about_image_url, c.about_items from collections c where c.address = $1`, [address]) });
+  res.json({ collection: await one(`select ${COLLECTION_COLS}, ${await detailCols()} from collections c where c.address = $1`, [address]) });
 }));
 
 /** Removes a collection (and its items, orders and activity) from the marketplace database. On-chain nothing changes. */

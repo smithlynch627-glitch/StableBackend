@@ -283,6 +283,8 @@ begin
   execute format('alter table %I.collections add column if not exists about_image_url text', s);
   execute format($a$alter table %I.collections add column if not exists about_items jsonb not null default '[]'$a$, s);
   execute format('alter table %I.collections add column if not exists drop_hidden boolean not null default false', s);
+  -- up to three extra images beside the logo on the mint page (set by the creator or an admin)
+  execute format($a$alter table %I.collections add column if not exists gallery jsonb not null default '[]'$a$, s);
   execute format('create index if not exists collections_volume_idx on %I.collections (volume_24h_wei desc)', s);
   execute format('create index if not exists collections_created_idx on %I.collections (created_at desc)', s);
 
